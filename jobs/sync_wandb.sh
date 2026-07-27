@@ -10,7 +10,25 @@
 # recording cannot fail; it only defers, and this is the deferred half.
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
+# Locate _env.sh. Slurm copies a batch script to /var/spool/slurmd/job<id>/,
+# so BASH_SOURCE points there and not at the repo — the sibling-file assumption
+# that works when running this directly is wrong under sbatch. SLURM_SUBMIT_DIR
+# is where sbatch was invoked from; both it and its jobs/ subdirectory are
+# checked, so submitting from the repo root or from inside jobs/ both work.
+_find_env() {
+    local candidate
+    for candidate in "${SLURM_SUBMIT_DIR:-}/jobs" "${SLURM_SUBMIT_DIR:-}" \
+                     "$(dirname "${BASH_SOURCE[0]}")" "$(pwd)/jobs" "$(pwd)"; do
+        if [ -n "$candidate" ] && [ -f "$candidate/_env.sh" ]; then
+            printf '%s' "$candidate/_env.sh"
+            return 0
+        fi
+    done
+    echo "Cannot find jobs/_env.sh (looked near SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-unset}" >&2
+    echo "and $(pwd)). Submit from the repository root: sbatch jobs/<script>.sh" >&2
+    return 1
+}
+source "$(_find_env)"
 cd "$REPO_DIR"
 
 CLEAN="${1:-}"
