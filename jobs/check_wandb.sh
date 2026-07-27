@@ -19,7 +19,9 @@
 #SBATCH --partition=savio3_gpu
 #SBATCH --qos=a40_gpu3_normal
 #SBATCH --gres=gpu:A40:1
-#SBATCH --cpus-per-task=2
+# 8, not fewer: a40_gpu3_normal enforces a minimum CPU-to-GPU ratio and a
+# smaller request sits in the queue forever as QOSMinCpuNotSatisfied.
+#SBATCH --cpus-per-task=8
 #SBATCH --time=00:10:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
