@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.DS_Store
+IMPL.txt
+PAPER
+vertical_routing_package_review/
+
+# Experiment artefacts: reproducible from the recorded commands, so the
+# records themselves are what gets shared, not the bytes.
+data/
+checkpoints/
+results/
+wandb/PAPER

@@ -1,0 +1,128 @@
+#!/bin/bash
+# Shared environment for every Savio job in this directory. Sourced, not run.
+#
+# Home is a 10 GB quota. uv's package cache, uv's managed interpreters, the
+# Hugging Face cache and Weights & Biases run data all default to home and all
+# of them will fill it, so each is redirected to scratch.
+#
+# Weights & Biases logs **online**: Savio compute nodes do reach the service,
+# confirmed on this account. WANDB_CONFIG_DIR is deliberately *not* redirected —
+# it is a small settings file, and moving it risks disturbing a `wandb login`
+# that already works, which is not a trade worth making to save kilobytes. The
+# credentials themselves live in ~/.netrc and are untouched either way.
+#
+# WANDB_MODE=offline remains available and jobs/sync_wandb.sh pushes afterwards.
+# Worth reaching for if a node turns out to be firewalled or the service is
+# unreachable mid-run; offline recording cannot fail, it just defers.
+
+# Not `set -e` here: this file is sourced, and killing the caller's shell on a
+# non-zero probe would be surprising.
+set -uo pipefail
+
+SCRATCH_ROOT="${SCRATCH_ROOT:-/global/scratch/users/iparra}"
+REPO_DIR="${REPO_DIR:-$SCRATCH_ROOT/effortless-dev}"
+
+# uv installs to ~/.local/bin, which a non-interactive batch shell will not have
+# on its PATH.
+export PATH="$HOME/.local/bin:$PATH"
+
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$SCRATCH_ROOT/.cache/uv}"
+export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$SCRATCH_ROOT/.local/uv-python}"
+export HF_HOME="${HF_HOME:-$SCRATCH_ROOT/.cache/huggingface}"
+export TOKENIZERS_PARALLELISM=false
+
+# ---------------------------------------------------------------- Weights & Biases
+export WANDB_PROJECT="${WANDB_PROJECT:-effortless-vertical-routing}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_DIR="${WANDB_DIR:-$SCRATCH_ROOT/wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$SCRATCH_ROOT/.cache/wandb}"
+
+# A stable run id keyed on the *experiment*, not on the Slurm job id. A requeued
+# or resumed job gets a new job id, and keying on that would split one training
+# run across several W&B runs with the step counter restarting inside each.
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_NAME:-local}}"
+export WANDB_RESUME="${WANDB_RESUME:-allow}"
+
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$HF_HOME"
+
+# ---------------------------------------------------------------- reporting
+report_env() {
+    echo "=================================================================="
+    echo "Job        ${SLURM_JOB_NAME:-<none>} (${SLURM_JOB_ID:-<none>})"
+    echo "Node       ${SLURMD_NODENAME:-<none>}"
+    echo "GPUs       ${CUDA_VISIBLE_DEVICES:-<none>}  (count ${N_GPUS:-?})"
+    echo "Repo       $REPO_DIR"
+    # Which interpreter actually ran. Worth a line: `uv run` uses the project's
+    # .venv and ignores an active conda environment, so a log that does not say
+    # which one it used leaves "wrong environment" and "real bug" looking
+    # identical when something imports differently than expected.
+    echo "Python     $(command -v uv >/dev/null 2>&1 \
+        && (cd "$REPO_DIR" 2>/dev/null && uv run python -c \
+            "import sys; print(sys.executable)" 2>/dev/null) \
+        || echo '<uv not found>')"
+    [ -n "${CONDA_PREFIX:-}" ] && echo "           (conda env $CONDA_PREFIX is active but unused)"
+    echo "Started    $(timestamp)"
+    echo "wandb      project=$WANDB_PROJECT mode=$WANDB_MODE id=$WANDB_RUN_ID"
+    if [ "$WANDB_MODE" = "online" ] && ! wandb_credentials_present; then
+        echo "wandb      WARNING: online mode, but no WANDB_API_KEY and no"
+        echo "           api.wandb.ai entry in ${NETRC:-$HOME/.netrc}. The run"
+        echo "           will go anonymous or fail. Fix with 'wandb login', or"
+        echo "           submit with WANDB_MODE=offline and sync afterwards."
+    fi
+    echo "=================================================================="
+}
+
+# Whether a Weights & Biases credential is reachable. `wandb login` writes an
+# api.wandb.ai entry to ~/.netrc; WANDB_API_KEY overrides it. Checked so an
+# online run that is about to go anonymous says so at the top of the log rather
+# than at the end of training.
+wandb_credentials_present() {
+    [ -n "${WANDB_API_KEY:-}" ] && return 0
+    local netrc="${NETRC:-$HOME/.netrc}"
+    [ -f "$netrc" ] && grep -q "api.wandb.ai" "$netrc" 2>/dev/null
+}
+
+# Number of GPUs visible to this job. Slurm reports it when --gres is used;
+# nvidia-smi is the fallback for interactive testing.
+detect_gpus() {
+    if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
+        echo "$SLURM_GPUS_ON_NODE"
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi -L 2>/dev/null | wc -l | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+# Most recent checkpoint in a directory, or empty. Used for automatic resume, so
+# a requeued job continues instead of silently restarting from step zero.
+#
+# Written with a glob rather than `ls | sort -V | tail -1` for two reasons, one
+# of which is a bug rather than a preference. Under `set -euo pipefail` the `ls`
+# fails when the directory holds no checkpoints yet — which is the state of
+# *every* first run — the failure propagates through pipefail, and the job dies
+# before training starts. The second reason is that `sort -V` is GNU-only, so
+# the pipeline was not testable outside Linux either.
+latest_checkpoint() {
+    local dir="$1" newest="" best=-1 file base step
+    shopt -s nullglob
+    for file in "$dir"/step-*.pt; do
+        base="$(basename "$file")"
+        step="${base#step-}"
+        step="${step%.pt}"
+        # 10# forces base ten: step-000020.pt would otherwise be read as octal.
+        step=$((10#$step))
+        if [ "$step" -gt "$best" ]; then
+            best="$step"
+            newest="$file"
+        fi
+    done
+    shopt -u nullglob
+    printf '%s' "$newest"
+}
+
+# ISO-8601 timestamp. `date -Is` is GNU-only and errors on BSD/macOS, which
+# makes these scripts untestable off the cluster for no benefit.
+timestamp() {
+    date +%Y-%m-%dT%H:%M:%S%z
+}
