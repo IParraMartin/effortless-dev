@@ -12,9 +12,11 @@
 #
 # No GPU: this is tokenization, which is CPU and I/O bound.
 #
-# **Internet.** Savio compute nodes cannot reliably reach the Hugging Face hub.
-# If this job dies resolving huggingface.co, pre-download on a login node — the
-# cache is on scratch and shared, so the compute node then finds it locally:
+# **Internet.** Compute nodes do have outbound access — a W&B connectivity check
+# uploaded from one — so the hub download normally just works. Different host,
+# though, so if this job dies resolving huggingface.co, pre-download on a login
+# node; the cache is on scratch and shared, so the compute node finds it
+# locally afterwards:
 #
 #   source jobs/_env.sh
 #   uv run python -c "import datasets; datasets.load_dataset( \
