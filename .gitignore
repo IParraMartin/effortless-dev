@@ -19,4 +19,4 @@ vertical_routing_package_review/
 data/
 checkpoints/
 results/
-wandb/PAPER
+wandb/
