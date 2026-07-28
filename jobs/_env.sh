@@ -31,6 +31,15 @@ export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$SCRATCH_ROOT/.local/uv-p
 export HF_HOME="${HF_HOME:-$SCRATCH_ROOT/.cache/huggingface}"
 export TOKENIZERS_PARALLELISM=false
 
+# Unbuffered Python. Not a preference — it is what makes a failed job
+# diagnosable. Writing to a file rather than a terminal, Python block-buffers
+# stdout in 8 KB chunks, so a process killed before it fills the buffer loses
+# everything it printed. A run that died during model construction and one that
+# never started produce byte-identical empty logs, and there is nothing left to
+# tell them apart. Costs a syscall per line, against a job that logs every
+# twentieth step.
+export PYTHONUNBUFFERED=1
+
 # ---------------------------------------------------------------- Weights & Biases
 export WANDB_PROJECT="${WANDB_PROJECT:-effortless-vertical-routing}"
 export WANDB_MODE="${WANDB_MODE:-online}"

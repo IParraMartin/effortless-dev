@@ -67,6 +67,35 @@ source "$(_find_env)"
 cd "$REPO_DIR"
 mkdir -p logs
 
+# Always end the log with a reason. Under `set -e` a failing torchrun exits the
+# script silently, and the last thing in the file is whatever it had printed --
+# which reads as a job that stopped mid-sentence for no reason.
+#
+# One honest limit: if the cgroup out-of-memory killer takes the whole job step,
+# this shell is killed too and the trap never runs. That case is why
+# PYTHONUNBUFFERED is set in _env.sh -- the trap explains ordinary failures, the
+# unbuffering preserves evidence for the ones that leave no chance to explain.
+_report_exit() {
+    local status=$?
+    [ "$status" -eq 0 ] && return 0
+    echo
+    echo "=================================================================="
+    echo "FAILED with status $status at $(timestamp)"
+    case "$status" in
+        137) echo "  137 is SIGKILL. On this cluster that is almost always the"
+             echo "  cgroup OOM killer, meaning host RAM, not GPU memory."
+             echo "  A CUDA OOM raises a Python exception and leaves a traceback." ;;
+        139) echo "  139 is a segmentation fault, usually a native library." ;;
+        143) echo "  143 is SIGTERM: the wall clock ran out, or scancel." ;;
+    esac
+    echo "Slurm's own accounting, which survives when the log does not:"
+    sacct -j "${SLURM_JOB_ID:-0}" \
+        -o JobID%20,JobName%12,State%22,ExitCode,MaxRSS,Elapsed 2>/dev/null \
+        || echo "  (sacct unavailable)"
+    echo "=================================================================="
+}
+trap _report_exit EXIT
+
 N_GPUS="$(detect_gpus)"
 [ "$N_GPUS" -ge 1 ] || { echo "No GPU visible; submit with --gres=gpu:A40:N"; exit 1; }
 report_env

@@ -184,6 +184,41 @@ _check_one() {
     fi
 }
 
+# Jobs that have already left the queue, from Slurm's accounting database.
+#
+# Worth showing unprompted. `squeue` forgets a job the moment it ends, so a run
+# that died overnight is simply absent from every live view -- indistinguishable
+# from one that was never submitted. And when a job is killed rather than
+# raising, its own log can be empty, leaving sacct as the only surviving record
+# of what happened.
+#
+# -X restricts output to the allocation row: without it every job also lists its
+# .batch and .extern steps, tripling the rows for no added information here.
+_check_recent() {
+    local filter="${1:-}" window="${2:-12hours}" rows shown=0
+    rows="$(sacct -u "$USER" -X -S "now-$window" -n -P \
+        -o JobID,JobName,State,ExitCode,Elapsed,NodeList 2>/dev/null)" || return 0
+    [ -n "$rows" ] || return 0
+
+    local jobid name state code elapsed node
+    while IFS='|' read -r jobid name state code elapsed node; do
+        [ -n "$jobid" ] || continue
+        case "$state" in RUNNING|PENDING|REQUEUED|RESIZING) continue ;; esac
+        if [ -n "$filter" ] && [ "$jobid" != "$filter" ] \
+           && ! printf '%s' "$name" | grep -q -- "$filter"; then
+            continue
+        fi
+        if [ "$shown" -eq 0 ]; then
+            printf '\nended in the last %s\n' "${window/hours/h}"
+        fi
+        # Exit code is "N:M" -- status and signal. Only interesting when non-zero.
+        case "$code" in 0:0|"") code="" ;; *) code=" ($code)" ;; esac
+        printf '%-9s %-15s %-4s %8s  %s%s\n' \
+            "$jobid" "$name" "" "$elapsed" "$state" "$code"
+        shown=$(( shown + 1 ))
+    done <<<"$rows"
+}
+
 check() {
     local filter="" verbose="" arg
     for arg in "$@"; do
@@ -197,6 +232,7 @@ check() {
     rows="$(squeue -u "$USER" -h -o '%i|%j|%T|%M|%l|%R' 2>/dev/null)"
     if [ -z "$rows" ]; then
         echo "check: no jobs queued or running for $USER"
+        _check_recent "$filter"
         return 0
     fi
 
@@ -216,5 +252,6 @@ check() {
     done <<<"$rows"
 
     [ "$shown" -eq 0 ] && echo "check: nothing matching '$filter'"
+    _check_recent "$filter"
     return 0
 }
