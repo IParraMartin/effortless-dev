@@ -15,6 +15,15 @@
 # glob is only a fallback for jobs that have already left the queue, since
 # scontrol forgets them a few minutes after they finish.
 
+# Drop any same-named alias before defining the function.
+#
+# Bash expands aliases *while parsing*, so if `follow` is already an alias the
+# line `follow() {` is rewritten before the parser reaches the parenthesis and
+# fails with "syntax error near unexpected token `('". The message points at
+# this file, which is misleading: nothing here is wrong, the name was simply
+# taken. Interactive shells commonly have such an alias from another project.
+unalias follow 2>/dev/null || true
+
 follow() {
     local jobid="${1:-}"
 

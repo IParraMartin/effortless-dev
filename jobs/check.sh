@@ -122,6 +122,15 @@ _check_elapsed_seconds() {
     echo $(( total + days * 86400 ))
 }
 
+# Drop any same-named alias before defining the function.
+#
+# Bash expands aliases *while parsing*, so if `check` is already an alias the
+# line `check() {` is rewritten before the parser reaches the parenthesis and
+# fails with "syntax error near unexpected token `('". The message points at
+# this file, which is misleading: nothing here is wrong, the name was simply
+# taken. Interactive shells commonly have such an alias from another project.
+unalias check 2>/dev/null || true
+
 check() {
     local filter="${1:-}"
     local rows
