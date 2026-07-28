@@ -153,6 +153,31 @@ If `learnable gain` is near zero on real text as well, request-level routing has
 no case and no amount of controller work will create one. That is the go/no-go,
 and it costs one job.
 
+## Watching jobs
+
+Two shell helpers, sourced rather than pasted:
+
+```bash
+echo "source $PWD/jobs/follow.sh" >> ~/.bashrc
+echo "source $PWD/jobs/check.sh"  >> ~/.bashrc
+```
+
+| Command | Does |
+|---|---|
+| `follow [jobid]` | tails one job's stdout and stderr live; defaults to your newest job |
+| `check [jobid\|name]` | one-shot status of every queued and running job |
+
+`check` resolves each log path from `scontrol show job`, **per job**, and never
+from a fixed directory. That is the whole point: a monitor pointed at one
+hardcoded results directory reports whatever last wrote there under whichever
+job it happens to be displaying, so a finished run from another project appears
+as live progress on a job that has barely started. Deriving the path from Slurm
+makes that unrepresentable, and makes the helper work for any job in any repo.
+
+It also flags the two failures that look healthy in `squeue`: a running job
+whose log has gone quiet for ten minutes, and one whose log contains a
+traceback or an out-of-memory error.
+
 ## Local testing
 
 These scripts run off the cluster, which is how two bugs in them were found (a
