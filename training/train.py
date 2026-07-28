@@ -344,15 +344,20 @@ def main(
                     if counts[i] > 0
                 )
                 elapsed = time.time() - started
+                # Throughput belongs in the log, not only in the tracker. It is
+                # the number that decides whether a run fits its wall clock, and
+                # needing a browser open to read it is a poor trade when the
+                # decision is usually made in the first minute.
+                throughput = (
+                    (step + 1 - start_step) * tokens_per_step / max(elapsed, 1e-6)
+                )
 
                 tracker.log(
                     {
                         "train/loss": mean_loss,
                         "train/lr": lr,
                         "train/tokens": (step + 1) * tokens_per_step,
-                        "train/tokens_per_sec": (step + 1 - start_step)
-                        * tokens_per_step
-                        / max(elapsed, 1e-6),
+                        "train/tokens_per_sec": throughput,
                         **(
                             {"train/kv_reconstruction": kv_mean}
                             if model_config.learned_kv_propagation
@@ -377,9 +382,13 @@ def main(
                     if model_config.learned_kv_propagation
                     else ""
                 )
+                remaining = (train_config.max_steps - step - 1) * tokens_per_step
+                eta_hours = remaining / max(throughput, 1e-6) / 3600
+
                 print(
                     f"step {step:>6}  loss {mean_loss:.4f}  lr {lr:.2e}"
-                    f"{kv_note}  {elapsed:.1f}s\n          exits {per_exit}",
+                    f"{kv_note}  {throughput:,.0f} tok/s  eta {eta_hours:.1f}h"
+                    f"\n          exits {per_exit}",
                     flush=True,
                 )
 
