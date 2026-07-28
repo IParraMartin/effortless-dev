@@ -117,11 +117,17 @@ case "$VARIANT" in
     # pass, so they cannot be freed as the loop advances: about 0.4 GB per exit
     # per sequence at 1024 tokens and a 50k vocabulary.
     #
-    # Set it to "none" to score every exit. That costs memory but buys two
-    # things worth having on several GPUs: full gradient coverage every step,
-    # and no need for find_unused_parameters, whose overhead grows with the
-    # number of ranks. On a 24 GB card, batch 4 scoring all six exits costs the
-    # same as batch 8 scoring three.
+    # Setting it to "none" scores every exit. Rarely worth it, and the reason
+    # is arithmetic rather than memory: one vocabulary projection costs 5.5
+    # blocks at this width, so going from three scored exits to six adds more
+    # compute than the entire 12-block backbone — **1.58x per token**. It also
+    # buys less than it appears to. The rotation is deterministic, so over a
+    # 25,000-step run each shallow exit is still visited about 10,000 times;
+    # coverage is a question of the whole run, not of any one step. The
+    # find_unused_parameters it avoids costs milliseconds.
+    #
+    # Reach for it only if a run shows shallow exits failing to converge, which
+    # would be evidence the rotation really is too sparse.
     EXITS_PER_STEP="${EXITS_PER_STEP:-2}"
     ARCH_FLAGS=(
         --exit_every=2
