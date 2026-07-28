@@ -207,7 +207,9 @@ echo "global batch = $((BATCH_SIZE * GRAD_ACCUM * N_GPUS)) sequences"
 echo "             = $TOKENS_PER_STEP tokens/step"
 echo "total budget = $TOTAL_TOKENS tokens over $MAX_STEPS steps"
 
-uv run torchrun \
+# `python -m torch.distributed.run` is exactly what the `torchrun` console
+# script invokes, reached without depending on a shebang or on PATH.
+"${PY[@]}" -m torch.distributed.run \
     --nnodes=1 --nproc_per_node="$N_GPUS" \
     --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
     -m training.train \

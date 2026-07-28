@@ -40,6 +40,30 @@ export TOKENIZERS_PARALLELISM=false
 # twentieth step.
 export PYTHONUNBUFFERED=1
 
+# ---------------------------------------------------------------- interpreter
+# Call the virtual environment's interpreter directly rather than going through
+# `uv run`, which is not free here: it re-resolves the project and takes a lock
+# on .venv before it will execute anything, and .venv lives on scratch. Measured
+# on a login node, `uv run python -c "import torch"` took 94 seconds wall for 7
+# seconds of CPU -- almost all of it blocked on the filesystem, and that was one
+# command. A job pays it at every invocation, and two jobs sharing one .venv
+# contend for the same lock; that is how vr-exits spent 24 minutes at 63 MB of
+# resident memory and exited before Python ever started.
+#
+# Nothing is lost by skipping it. The environment is already built by
+# jobs/setup_env.sh, so there is nothing to resolve at job start, and naming the
+# interpreter is what `uv run` would have arrived at anyway. `uv` remains the
+# right tool for *changing* the environment -- just not for entering it.
+#
+# The fallback keeps this working before setup_env.sh has ever run.
+VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv}"
+if [ -x "$VENV_DIR/bin/python" ]; then
+    PY=("$VENV_DIR/bin/python")
+else
+    PY=(uv run python)
+fi
+export VENV_DIR
+
 # ---------------------------------------------------------------- Weights & Biases
 export WANDB_PROJECT="${WANDB_PROJECT:-effortless-vertical-routing}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -61,14 +85,15 @@ report_env() {
     echo "Node       ${SLURMD_NODENAME:-<none>}"
     echo "GPUs       ${CUDA_VISIBLE_DEVICES:-<none>}  (count ${N_GPUS:-?})"
     echo "Repo       $REPO_DIR"
-    # Which interpreter actually ran. Worth a line: `uv run` uses the project's
-    # .venv and ignores an active conda environment, so a log that does not say
+    # Which interpreter actually ran. Worth a line: these jobs use the project's
+    # .venv and ignore an active conda environment, so a log that does not say
     # which one it used leaves "wrong environment" and "real bug" looking
     # identical when something imports differently than expected.
-    echo "Python     $(command -v uv >/dev/null 2>&1 \
-        && (cd "$REPO_DIR" 2>/dev/null && uv run python -c \
-            "import sys; print(sys.executable)" 2>/dev/null) \
-        || echo '<uv not found>')"
+    #
+    # Printed, not executed. This used to run `uv run python -c` to ask the
+    # interpreter for its own path, which meant the banner itself blocked on the
+    # scratch filesystem for a minute and a half before the job could start.
+    echo "Python     ${PY[*]}"
     [ -n "${CONDA_PREFIX:-}" ] && echo "           (conda env $CONDA_PREFIX is active but unused)"
     echo "Started    $(timestamp)"
     echo "wandb      project=$WANDB_PROJECT mode=$WANDB_MODE id=$WANDB_RUN_ID"

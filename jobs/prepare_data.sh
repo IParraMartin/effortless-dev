@@ -70,7 +70,7 @@ echo "dataset=$DATASET config=$CONFIG column=$COLUMN"
 # Streaming keeps peak memory flat: tokens are appended to disk as they are
 # produced rather than assembled in RAM, so a corpus far larger than the node
 # can be prepared.
-uv run python -m training.data \
+"${PY[@]}" -m training.data \
     --dataset_name="$DATASET" \
     --dataset_config="$CONFIG" \
     --text_column="$COLUMN" \

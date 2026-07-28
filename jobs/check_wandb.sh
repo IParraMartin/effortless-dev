@@ -53,7 +53,7 @@ N_GPUS="$(detect_gpus)"
 report_env
 
 WANDB_RUN_ID="wandb-check-${SLURM_JOB_ID:-local}" \
-uv run python - <<'PY'
+"${PY[@]}" - <<'PY'
 import os
 import sys
 

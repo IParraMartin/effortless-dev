@@ -33,7 +33,11 @@ cd "$REPO_DIR"
 
 CLEAN="${1:-}"
 
-if [ -z "${WANDB_API_KEY:-}" ] && [ ! -f "$WANDB_CONFIG_DIR/settings" ]; then
+# Uses the shared credential probe rather than testing $WANDB_CONFIG_DIR, which
+# _env.sh deliberately no longer sets -- referencing it here was an unbound
+# variable under `set -u`, so this check aborted the script it was meant to
+# guard. `wandb login` writes to ~/.netrc, which is what the probe reads.
+if ! wandb_credentials_present; then
     echo "Not logged in to Weights & Biases."
     echo "Either export WANDB_API_KEY=... or run: uv run wandb login"
     exit 1
@@ -65,7 +69,7 @@ for run in ${RUNS[@]+"${RUNS[@]}"}; do
     echo "--- $(basename "$run")"
     # Do not abort the loop on one bad run; a single corrupted transaction log
     # should not block every other run from being uploaded.
-    if uv run wandb sync --project "$WANDB_PROJECT" "$run"; then
+    if "${PY[@]}" -m wandb sync --project "$WANDB_PROJECT" "$run"; then
         if [ "$CLEAN" = "--clean" ]; then
             rm -rf "$run"
             echo "    removed after successful sync"

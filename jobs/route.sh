@@ -76,7 +76,7 @@ mkdir -p "$RESULTS"
 #    separately so the price of compute can change later without recollecting.
 #    Free-running labels cost generation but are the only ones that support a
 #    serving claim, so they are collected rather than skipped.
-uv run python -m experiments.collect_depth_trajectories \
+"${PY[@]}" -m experiments.collect_depth_trajectories \
     --checkpoint="$CHECKPOINT" \
     --out="$RESULTS/trajectories" \
     --probe_depth="${PROBE_DEPTH:-2}" \
@@ -87,7 +87,7 @@ uv run python -m experiments.collect_depth_trajectories \
 # 2. Fit the controller on the frozen backbone, over several seeds. Every seed
 #    is reported; the split is by source, and the held-out half is split again
 #    so calibration never touches the reported numbers.
-uv run python -m experiments.train_depth_controller \
+"${PY[@]}" -m experiments.train_depth_controller \
     --trajectories="$RESULTS/trajectories" \
     --out="$RESULTS/controller" \
     --quality_metric="${QUALITY_METRIC:-teacher_forced_accuracy}" \
@@ -98,7 +98,7 @@ uv run python -m experiments.train_depth_controller \
 MANIFEST_FLAGS=()
 [ -n "$MANIFEST" ] && MANIFEST_FLAGS=(--manifest="$MANIFEST")
 
-uv run python -m experiments.evaluate_vertical_routing \
+"${PY[@]}" -m experiments.evaluate_vertical_routing \
     --trajectories="$RESULTS/trajectories" \
     --controller="$RESULTS/controller" \
     --out="$RESULTS/evaluation" \
@@ -110,7 +110,7 @@ uv run python -m experiments.evaluate_vertical_routing \
 # checkpoint this reports latency for a 64-wide toy, which shares no kernel
 # regime with a 768-wide model and whose vocabulary head is three orders of
 # magnitude cheaper.
-uv run python -m experiments.benchmark_latency \
+"${PY[@]}" -m experiments.benchmark_latency \
     --checkpoint="$CHECKPOINT" \
     --out="$RESULTS/latency" \
     --device="${DEVICE:-cuda}" \
