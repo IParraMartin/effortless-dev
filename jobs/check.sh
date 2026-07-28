@@ -1,37 +1,50 @@
 #!/bin/bash
-# `check` — what every one of your Slurm jobs is actually doing, right now.
+# `check` — what every one of your Slurm jobs is doing, one line each.
 #
-# Add to ~/.bashrc:
+# Add to ~/.bashrc (after any same-named alias):
 #
 #     source /global/scratch/users/iparra/effortless-dev/jobs/check.sh
 #
 # Then:
 #
 #     check              # every job you have queued or running
-#     check 35926835     # one job
-#     check vr-probe1    # every job whose name matches
+#     check 35936978     # one job
+#     check vr-          # every job whose name matches
+#     check -v           # add log paths and node names
 #
-# Every path is resolved **per job**, from `scontrol show job`, and never from a
-# fixed location. That is the whole design constraint: a monitor that reads
-# progress out of one hardcoded directory reports whatever last wrote there,
-# attributed to whichever job it happened to be looking at — so a finished
-# experiment from another project shows up as live progress under the name of a
-# job that has barely started.
-#
-# It also means this works for any job, in any repository, with no per-project
-# configuration.
+# Every log path is resolved **per job**, from `scontrol show job`, never from a
+# fixed location. A monitor pointed at one hardcoded directory reports whatever
+# last wrote there under whichever job it is displaying, so a finished run from
+# another project appears as live progress on a job that has barely started.
+# Deriving the path from Slurm makes that unrepresentable and makes this work
+# for any job in any repository, with no per-project configuration.
 
-# Seconds since a file was last written. `stat` takes different flags on GNU and
-# BSD, and this is sourced into interactive shells on both.
-_check_age() {
-    local file="$1" mtime now
-    mtime="$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null)"
-    [ -n "$mtime" ] || return 1
-    now="$(date +%s)"
-    echo $(( now - mtime ))
+# Drop any same-named alias before defining the function. Bash expands aliases
+# *while parsing*, so if `check` is already an alias the definition line is
+# rewritten before the parser reaches the parenthesis and fails with "syntax
+# error near unexpected token `('" — pointing at this file, though nothing here
+# is wrong. An interactive shell commonly has such an alias from another project.
+unalias check 2>/dev/null || true
+
+# Slurm elapsed and limit strings, as [DD-]HH:MM:SS or MM:SS, into seconds.
+# Parsed with parameter expansion rather than `read -a`, which is spelled `-a`
+# in bash and `-A` in zsh and so breaks in whichever one it was not written for.
+_check_seconds() {
+    local t="$1" days=0 total=0 part
+    case "$t" in
+        *INFINITE*|*UNLIMITED*|"") echo ""; return ;;
+        *-*) days="${t%%-*}"; t="${t#*-}" ;;
+    esac
+    while [ -n "$t" ]; do
+        part="${t%%:*}"
+        # 10# forces base ten: "08" is not a valid octal literal.
+        total=$(( total * 60 + 10#${part:-0} ))
+        [ "$t" = "$part" ] && break
+        t="${t#*:}"
+    done
+    echo $(( total + days * 86400 ))
 }
 
-# "3m", "2h10m" — a duration worth reading at a glance.
 _check_duration() {
     local s="$1"
     if [ "$s" -lt 60 ]; then echo "${s}s"
@@ -40,54 +53,52 @@ _check_duration() {
     fi
 }
 
-_check_ago() { echo "$(_check_duration "$1") ago"; }
+_check_age() {
+    local mtime
+    mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)"
+    [ -n "$mtime" ] && echo $(( $(date +%s) - mtime ))
+}
 
-_check_one() {
-    local jobid="$1" name="$2" state="$3" elapsed="$4" limit="$5" where="$6"
-    local info out err age line steps
-
-    printf '%-11s %-20s %-3s %s/%s  %s\n' \
-        "$jobid" "$name" "${state:0:3}" "$elapsed" "$limit" "$where"
-
-    # Pending jobs have no output yet; the reason is already in `where`.
-    if [ "$state" != "RUNNING" ] && [ "$state" != "COMPLETING" ]; then
-        return
-    fi
-
-    info="$(scontrol show job "$jobid" 2>/dev/null || true)"
-    out="$(sed -n 's/.*StdOut=\([^[:space:]]*\).*/\1/p' <<<"$info" | head -1)"
-    err="$(sed -n 's/.*StdErr=\([^[:space:]]*\).*/\1/p' <<<"$info" | head -1)"
-
-    if [ -z "$out" ] || [ ! -e "$out" ]; then
-        echo "     log      (no output file yet)"
-        return
-    fi
-
-    age="$(_check_age "$out")"
-    printf '     log      %s   %s\n' "$out" "$(_check_ago "${age:-0}")"
-
-    # A running job whose log has gone quiet is the failure this is for: it
-    # looks identical to a healthy one in squeue.
-    if [ -n "$age" ] && [ "$age" -gt 600 ]; then
-        echo "     !!       no output for $(_check_duration "$age") while RUNNING — possibly stalled"
-    fi
-
-    # Last thing the job said. Generic on purpose: any job, any format.
-    line="$(grep -v '^[[:space:]]*$' "$out" 2>/dev/null | tail -1)"
-    [ -n "$line" ] && printf '     latest   %s\n' "${line:0:100}"
-
-    # Rate and ETA from the *differences* between the last two step lines, not
-    # from total steps over job elapsed. The latter charges queue-to-start,
-    # model construction and the first data load against the training rate,
-    # which understated a real run by 55% — enough to make an 18-hour job look
-    # like a 27-hour one and provoke a needless resize.
-    #
-    # The trailing "over N steps" of the sizing banner supplies the target, so
-    # the ETA is the job's own arithmetic rather than an assumption about it.
-    local target
+# One compact progress string from a training log.
+#
+# Rate comes from the *difference* between the last two step lines, never from
+# total steps over job elapsed: the latter charges queue-to-start, model
+# construction and the first data load against the training rate, which
+# understated a real run by 55% — enough to make an 18-hour job look like 27.
+_check_progress() {
+    local out="$1" target
     target="$(grep -oE 'over [0-9]+ steps' "$out" 2>/dev/null | tail -1 \
         | grep -oE '[0-9]+')"
+
     grep -E '^step +[0-9]+' "$out" 2>/dev/null | tail -2 | awk -v target="${target:-0}" '
+        {
+            step[NR] = $2
+            for (i = 1; i <= NF; i++) {
+                if ($i == "loss") loss = $(i + 1)
+                if ($i ~ /^[0-9.]+s$/) secs[NR] = substr($i, 1, length($i) - 1)
+            }
+        }
+        END {
+            if (NR == 0) exit
+            printf "step %s", step[NR]
+            if (loss != "") printf "  loss %s", loss
+            if (NR < 2 || secs[2] <= secs[1]) { printf "\n"; exit }
+            rate = (step[2] - step[1]) / (secs[2] - secs[1])
+            if (rate <= 0) { printf "\n"; exit }
+            printf "  %.0f/min", rate * 60
+            if (target > step[2]) printf "  eta %.1fh", (target - step[2]) / rate / 3600
+            printf "\n"
+        }'
+}
+
+# Seconds of work still ahead, for comparing against the wall clock.
+_check_eta_seconds() {
+    local out="$1" target
+    target="$(grep -oE 'over [0-9]+ steps' "$out" 2>/dev/null | tail -1 \
+        | grep -oE '[0-9]+')"
+    [ -n "$target" ] || return
+
+    grep -E '^step +[0-9]+' "$out" 2>/dev/null | tail -2 | awk -v target="$target" '
         {
             step[NR] = $2
             for (i = 1; i <= NF; i++)
@@ -96,60 +107,93 @@ _check_one() {
         END {
             if (NR < 2 || secs[2] <= secs[1]) exit
             rate = (step[2] - step[1]) / (secs[2] - secs[1])
-            if (rate <= 0) exit
-            printf "     rate     step %d  %.1f steps/min", step[2], rate * 60
-            if (target > step[2])
-                printf "  ->  eta %.1fh", (target - step[2]) / rate / 3600
-            printf "\n"
+            if (rate > 0 && target > step[2]) printf "%d", (target - step[2]) / rate
         }'
+}
 
-    # Anything that looks like a failure, in either stream. Cheap and it is the
-    # thing you most want surfaced without reading the whole log.
-    local problems=0 count file
-    for file in "$out" ${err:+"$err"}; do
-        [ -e "$file" ] || continue
-        count="$(grep -cE 'Traceback|CUDA out of memory|Error|FAILED|Killed' \
-            "$file" 2>/dev/null || true)"
-        problems=$(( problems + ${count:-0} ))
-    done
-    if [ "$problems" -gt 0 ]; then
-        echo "     !!       $problems line(s) matching Traceback/OOM/Error — check the log"
+_check_one() {
+    local jobid="$1" name="$2" state="$3" elapsed="$4" limit="$5" where="$6"
+    local verbose="$7"
+    local short detail out err age eta remaining problems=0 count file
+
+    case "$state" in
+        RUNNING)    short=RUN ;;
+        PENDING)    short=PEND ;;
+        COMPLETING) short=COMP ;;
+        SUSPENDED)  short=SUSP ;;
+        *)          short="${state:0:4}" ;;
+    esac
+
+    if [ "$state" != "RUNNING" ] && [ "$state" != "COMPLETING" ]; then
+        printf '%-9s %-15s %-4s %8s  %s\n' "$jobid" "$name" "$short" "-" "$where"
+        return
+    fi
+
+    out="$(scontrol show job "$jobid" 2>/dev/null \
+        | sed -n 's/.*StdOut=\([^[:space:]]*\).*/\1/p' | head -1)"
+    err="$(scontrol show job "$jobid" 2>/dev/null \
+        | sed -n 's/.*StdErr=\([^[:space:]]*\).*/\1/p' | head -1)"
+
+    detail=""
+    if [ -n "$out" ] && [ -e "$out" ]; then
+        detail="$(_check_progress "$out")"
+        # No step lines yet: fall back to whatever the job last said, trimmed
+        # of leading space so continuation lines do not look like columns.
+        if [ -z "$detail" ]; then
+            detail="$(grep -v '^[[:space:]]*$' "$out" | tail -1 \
+                | sed 's/^[[:space:]]*//' | cut -c1-58)"
+        fi
+    else
+        detail="(no output yet)"
+    fi
+
+    printf '%-9s %-15s %-4s %8s  %s\n' \
+        "$jobid" "$name" "$short" "$elapsed" "$detail"
+
+    # Warnings, indented, and only when they apply.
+    if [ -n "$out" ] && [ -e "$out" ]; then
+        age="$(_check_age "$out")"
+        if [ -n "$age" ] && [ "$age" -gt 600 ]; then
+            printf '%42s!! silent for %s — possibly stalled\n' "" \
+                "$(_check_duration "$age")"
+        fi
+
+        # Work remaining against clock remaining. This is the warning worth
+        # having: a job that will hit its wall clock before it finishes looks
+        # completely healthy until the moment it is killed.
+        eta="$(_check_eta_seconds "$out")"
+        remaining="$(_check_seconds "$limit")"
+        if [ -n "$eta" ] && [ -n "$remaining" ]; then
+            remaining=$(( remaining - $(_check_seconds "$elapsed") ))
+            if [ "$eta" -gt "$remaining" ]; then
+                printf '%42s!! needs %s but only %s left on the clock\n' "" \
+                    "$(_check_duration "$eta")" "$(_check_duration "$remaining")"
+            fi
+        fi
+
+        for file in "$out" ${err:+"$err"}; do
+            [ -e "$file" ] || continue
+            count="$(grep -cE 'Traceback|CUDA out of memory|FAILED|Killed' \
+                "$file" 2>/dev/null || true)"
+            problems=$(( problems + ${count:-0} ))
+        done
+        [ "$problems" -gt 0 ] && \
+            printf '%42s!! %s line(s) matching Traceback/OOM/Killed\n' "" "$problems"
+
+        [ -n "$verbose" ] && printf '%42s%s\n' "" "$out"
     fi
 }
 
-# Slurm elapsed times come as [DD-]HH:MM:SS or MM:SS.
-_check_elapsed_seconds() {
-    local t="$1" days=0
-    case "$t" in
-        *-*) days="${t%%-*}"; t="${t#*-}" ;;
-    esac
-    # Walk the colon-separated fields with parameter expansion rather than
-    # `read -a`, which is spelled `-a` in bash and `-A` in zsh and so fails in
-    # whichever one you did not write it for. 10# forces base ten: "08" is not
-    # a valid octal literal and would abort the arithmetic.
-    local total=0 part
-    while [ -n "$t" ]; do
-        part="${t%%:*}"
-        total=$(( total * 60 + 10#${part:-0} ))
-        [ "$t" = "$part" ] && break
-        t="${t#*:}"
-    done
-    echo $(( total + days * 86400 ))
-}
-
-# Drop any same-named alias before defining the function.
-#
-# Bash expands aliases *while parsing*, so if `check` is already an alias the
-# line `check() {` is rewritten before the parser reaches the parenthesis and
-# fails with "syntax error near unexpected token `('". The message points at
-# this file, which is misleading: nothing here is wrong, the name was simply
-# taken. Interactive shells commonly have such an alias from another project.
-unalias check 2>/dev/null || true
-
 check() {
-    local filter="${1:-}"
-    local rows
+    local filter="" verbose="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            -v|--verbose) verbose=1 ;;
+            *) filter="$arg" ;;
+        esac
+    done
 
+    local rows
     rows="$(squeue -u "$USER" -h -o '%i|%j|%T|%M|%l|%R' 2>/dev/null)"
     if [ -z "$rows" ]; then
         echo "check: no jobs queued or running for $USER"
@@ -159,22 +203,18 @@ check() {
     local shown=0
     while IFS='|' read -r jobid name state elapsed limit where; do
         [ -n "$jobid" ] || continue
-        if [ -n "$filter" ] \
-           && [ "$jobid" != "$filter" ] \
+        if [ -n "$filter" ] && [ "$jobid" != "$filter" ] \
            && ! printf '%s' "$name" | grep -q -- "$filter"; then
             continue
         fi
         if [ "$shown" -eq 0 ]; then
-            printf '%-11s %-20s %-3s %s  %s\n' \
-                "JOBID" "NAME" "ST" "ELAPSED/LIMIT" "NODE / REASON"
-            printf '%s\n' \
-                "------------------------------------------------------------------------"
+            printf '%-9s %-15s %-4s %8s  %s\n' \
+                "JOBID" "NAME" "ST" "ELAPSED" "PROGRESS / REASON"
         fi
-        _check_one "$jobid" "$name" "$state" "$elapsed" "$limit" "$where"
+        _check_one "$jobid" "$name" "$state" "$elapsed" "$limit" "$where" "$verbose"
         shown=$(( shown + 1 ))
     done <<<"$rows"
 
-    if [ "$shown" -eq 0 ]; then
-        echo "check: nothing matching '$filter'"
-    fi
+    [ "$shown" -eq 0 ] && echo "check: nothing matching '$filter'"
+    return 0
 }

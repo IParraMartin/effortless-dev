@@ -165,7 +165,7 @@ echo "source $PWD/jobs/check.sh"  >> ~/.bashrc
 | Command | Does |
 |---|---|
 | `follow [jobid]` | tails one job's stdout and stderr live; defaults to your newest job |
-| `check [jobid\|name]` | one-shot status of every queued and running job |
+| `check [jobid\|name] [-v]` | one line per queued and running job: step, loss, rate, ETA |
 
 `check` resolves each log path from `scontrol show job`, **per job**, and never
 from a fixed directory. That is the whole point: a monitor pointed at one
@@ -174,9 +174,17 @@ job it happens to be displaying, so a finished run from another project appears
 as live progress on a job that has barely started. Deriving the path from Slurm
 makes that unrepresentable, and makes the helper work for any job in any repo.
 
-It also flags the two failures that look healthy in `squeue`: a running job
-whose log has gone quiet for ten minutes, and one whose log contains a
-traceback or an out-of-memory error.
+It flags three failures that look perfectly healthy in `squeue`:
+
+- a running job whose log has gone quiet for ten minutes;
+- one whose log holds a traceback, an OOM, or a kill;
+- one whose **ETA exceeds the time left on its wall clock** — invisible until
+  the moment Slurm kills it, and the cheapest of the three to act on.
+
+Rate and ETA come from the difference between the last two step lines, not from
+total steps over job elapsed. The latter charges queue-to-start, model
+construction and the first data load against the training rate, which
+understated a real run by 55%.
 
 ## Local testing
 
