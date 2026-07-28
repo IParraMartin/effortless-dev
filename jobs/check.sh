@@ -76,17 +76,32 @@ _check_one() {
     line="$(grep -v '^[[:space:]]*$' "$out" 2>/dev/null | tail -1)"
     [ -n "$line" ] && printf '     latest   %s\n' "${line:0:100}"
 
-    # If it looks like a training loop, say how fast it is going. Derived from
-    # the log's own step lines rather than assumed.
-    steps="$(grep -oE '^step +[0-9]+' "$out" 2>/dev/null | tail -1 | grep -oE '[0-9]+')"
-    if [ -n "$steps" ] && [ "$steps" -gt 0 ]; then
-        local secs
-        secs="$(_check_elapsed_seconds "$elapsed")"
-        if [ -n "$secs" ] && [ "$secs" -gt 0 ]; then
-            printf '     rate     step %s after %s  ->  %s steps/min\n' \
-                "$steps" "$elapsed" "$(( steps * 60 / secs ))"
-        fi
-    fi
+    # Rate and ETA from the *differences* between the last two step lines, not
+    # from total steps over job elapsed. The latter charges queue-to-start,
+    # model construction and the first data load against the training rate,
+    # which understated a real run by 55% — enough to make an 18-hour job look
+    # like a 27-hour one and provoke a needless resize.
+    #
+    # The trailing "over N steps" of the sizing banner supplies the target, so
+    # the ETA is the job's own arithmetic rather than an assumption about it.
+    local target
+    target="$(grep -oE 'over [0-9]+ steps' "$out" 2>/dev/null | tail -1 \
+        | grep -oE '[0-9]+')"
+    grep -E '^step +[0-9]+' "$out" 2>/dev/null | tail -2 | awk -v target="${target:-0}" '
+        {
+            step[NR] = $2
+            for (i = 1; i <= NF; i++)
+                if ($i ~ /^[0-9.]+s$/) secs[NR] = substr($i, 1, length($i) - 1)
+        }
+        END {
+            if (NR < 2 || secs[2] <= secs[1]) exit
+            rate = (step[2] - step[1]) / (secs[2] - secs[1])
+            if (rate <= 0) exit
+            printf "     rate     step %d  %.1f steps/min", step[2], rate * 60
+            if (target > step[2])
+                printf "  ->  eta %.1fh", (target - step[2]) / rate / 3600
+            printf "\n"
+        }'
 
     # Anything that looks like a failure, in either stream. Cheap and it is the
     # thing you most want surfaced without reading the whole log.
