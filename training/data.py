@@ -19,6 +19,7 @@ Run this module from the repository root to build the files::
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 from pathlib import Path
@@ -36,7 +37,22 @@ MAX_UINT16_VOCAB = 2**16
 
 #: Sidecar recording how a ``.bin`` was written. Without it the element size
 #: has to be guessed, and guessing wrong silently reinterprets every token.
+#: It is written only after a split finishes, which also makes it the marker
+#: for "this file is complete" rather than "this job died halfway".
 META_SUFFIX = ".meta.json"
+
+#: Documents held out for validation when a corpus ships no held-out split of
+#: its own. Small on purpose: validation here measures loss during training,
+#: and every document spent on it is one not trained on.
+HELD_OUT_DOCS = 2_000
+
+#: Sidecar fields that describe *what was tokenized*. A split may be reused
+#: only when every one of these still matches, so changing the corpus, the
+#: tokenizer or the document cap re-tokenizes instead of silently mixing.
+_IDENTITY_FIELDS = (
+    "dataset_name", "dataset_config", "text_column",
+    "tokenizer_name", "max_train_docs",
+)
 
 #: Version of the sidecar schema, so a reader can reject files it predates.
 META_SCHEMA_VERSION = 1
@@ -192,63 +208,222 @@ LOCAL_SUFFIXES = {".json": "json", ".jsonl": "json", ".parquet": "parquet",
                   ".csv": "csv", ".txt": "text", ".arrow": "arrow"}
 
 
-def _load_split(config: TrainConfig, split: str):
+def _completed(path: Path, config: TrainConfig, tokenizer_size: int) -> int | None:
+    """Reports whether a split on disk is finished and still matches the config.
+
+    Args:
+        path: The ``.bin`` file.
+        config: Run settings the file would have to agree with.
+        tokenizer_size: Vocabulary the tokenizer currently has.
+
+    Returns:
+        The token count of a reusable file, or ``None`` when it is absent,
+        unfinished, or was built from different settings. A file whose sidecar
+        disagrees is *not* reused: tokens from two different tokenizers in one
+        stream would train without error and mean nothing.
+    """
+    meta_path = Path(str(path) + META_SUFFIX)
+    if not path.exists() or not meta_path.exists():
+        return None
+
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        return None
+
+    if meta.get("schema_version") != META_SCHEMA_VERSION:
+        return None
+    if meta.get("tokenizer_size") != tokenizer_size:
+        return None
+    for field in _IDENTITY_FIELDS:
+        if meta.get(field) != getattr(config, field):
+            return None
+
+    # Cross-check the sidecar against the file it describes. A job killed
+    # between the last write and the sidecar cannot produce this state, but a
+    # truncated copy or a full disk can.
+    expected = meta.get("n_tokens", 0) * np.dtype(meta["dtype"]).itemsize
+    if path.stat().st_size != expected:
+        return None
+
+    return int(meta["n_tokens"])
+
+
+def _available_splits(config: TrainConfig) -> list[str] | None:
+    """Best-effort probe of a hub dataset's split names.
+
+    Args:
+        config: Run settings naming the dataset.
+
+    Returns:
+        The split names, or ``None`` when they could not be determined — an
+        offline node, a private repository, a dataset whose metadata needs a
+        script to evaluate. ``None`` means "unknown", never "none exist", and
+        the caller falls back to trusting the requested name.
+    """
+    try:
+        from datasets import get_dataset_split_names
+
+        return list(
+            get_dataset_split_names(config.dataset_name, config.dataset_config)
+        )
+    except Exception:
+        return None
+
+
+def needs_carving(config: TrainConfig) -> bool:
+    """Whether the held-out set must be cut out of the training corpus.
+
+    Decided **once per run**, not once per split, and that is the whole point.
+    Whether validation is carved changes what *training* is allowed to contain:
+    if the holdout comes off the front of the corpus, training has to skip past
+    it. Deciding separately for each split produced exactly that leak — training
+    kept every document while validation took the first two thousand, so the
+    held-out set sat inside the training data and eval loss measured nothing.
+
+    Args:
+        config: Run settings naming the dataset.
+
+    Returns:
+        ``True`` when the corpus has no held-out split of its own.
+    """
+    if Path(config.dataset_name).suffix.lower() in LOCAL_SUFFIXES:
+        return True
+
+    available = _available_splits(config)
+    if available is None:
+        return False
+    if "validation" in available or "test" in available:
+        return False
+    return "train" in available
+
+
+def _load_split(
+    config: TrainConfig,
+    split: str,
+    carve: bool | None = None,
+) -> tuple[object, bool]:
     """Opens one split of the configured corpus.
 
     Accepts three things without the caller having to say which: a hub
     repository id, a path to a local data file, and a glob matching several.
-    Held-out splits are also resolved leniently, since corpora disagree about
-    whether the second split is called ``validation`` or ``test``.
+
+    Split resolution is deliberately lenient, because corpora disagree about
+    what the held-out split is called and plenty of pretraining corpora do not
+    ship one at all. FineWeb-Edu is the case that motivated this: it has only
+    ``train``, and an earlier version trusted the requested name under
+    streaming and died with ``Bad split: validation`` *after* spending two
+    hours writing the training file.
 
     Args:
         config: Run settings naming the dataset and split behaviour.
         split: Either ``"train"`` or ``"validation"``.
+        carve: The run-wide decision from :func:`needs_carving`. Passing it
+            keeps both splits consistent; ``None`` re-derives it, which is
+            convenient for callers handling one split in isolation.
 
     Returns:
-        A ``Dataset`` or, under streaming, an ``IterableDataset``.
+        A tuple ``(dataset, derived)``. ``derived`` is ``True`` when the corpus
+        had no split of its own to serve this request and the caller must carve
+        one out of the training stream.
 
     Raises:
-        ValueError: If no usable split exists.
+        ValueError: If the dataset exists but has no usable split at all.
     """
     from datasets import load_dataset
 
     suffix = Path(config.dataset_name).suffix.lower()
     if suffix in LOCAL_SUFFIXES:
         # Local files carry no split metadata, so both splits read the same
-        # files and are separated by the caller.
-        return load_dataset(
+        # files and are separated by carving.
+        dataset = load_dataset(
             LOCAL_SUFFIXES[suffix],
             data_files=config.dataset_name,
             split="train",
             streaming=config.streaming,
         )
+        return dataset, True
 
-    if config.streaming:
-        # Split names cannot be probed without downloading metadata for the
-        # whole repository, so a stream trusts the name and reports failures.
-        resolved = split
+    if carve:
+        # The run-wide decision already says there is no held-out split, so
+        # both halves read the training corpus and are separated by carving.
+        return load_dataset(
+            config.dataset_name, config.dataset_config,
+            split="train", streaming=config.streaming,
+        ), True
+
+    available = _available_splits(config)
+
+    if available is None:
+        # Unknown: trust the caller and let load_dataset report a bad name.
+        resolved, derived = split, False
+    elif split in available:
+        resolved, derived = split, False
+    elif split == "validation" and "test" in available:
+        resolved, derived = "test", False
+    elif "train" in available:
+        # The common pretraining-corpus shape: one enormous train split and
+        # nothing else. Carve the held-out set out of it rather than failing.
+        resolved, derived = "train", True
     else:
-        from datasets import get_dataset_split_names
-
-        available = get_dataset_split_names(
-            config.dataset_name, config.dataset_config
+        raise ValueError(
+            f"{config.dataset_name}/{config.dataset_config} has splits "
+            f"{available}, none usable as {split!r} and no 'train' to derive "
+            f"one from."
         )
-        if split in available:
-            resolved = split
-        elif split == "validation" and "test" in available:
-            resolved = "test"
-        else:
-            raise ValueError(
-                f"{config.dataset_name}/{config.dataset_config} has splits "
-                f"{available}, none usable as {split!r}."
-            )
 
-    return load_dataset(
+    dataset = load_dataset(
         config.dataset_name,
         config.dataset_config,
         split=resolved,
         streaming=config.streaming,
     )
+    return dataset, derived
+
+
+def _carve(dataset, split: str, config: TrainConfig):
+    """Splits one corpus into disjoint training and validation streams.
+
+    Where the held-out documents come from depends on whether training is
+    capped, and the distinction matters more than it looks:
+
+    * **Capped** (``max_train_docs`` set). Validation is taken from *beyond*
+      where training stops. The two are disjoint, and the training stream is
+      byte-for-byte what it would have been with no holdout at all — so a
+      ``train.bin`` written before the holdout existed stays valid.
+    * **Uncapped**. There is no "beyond", so validation comes off the front and
+      training skips past it.
+
+    Args:
+        dataset: The training corpus, streaming or not.
+        split: ``"train"`` or ``"validation"``.
+        config: Run settings supplying the cap.
+
+    Returns:
+        The dataset restricted to that split's documents.
+    """
+    cap = config.max_train_docs
+
+    if config.streaming:
+        if split == "train":
+            return dataset if cap is not None else dataset.skip(HELD_OUT_DOCS)
+        if cap is not None:
+            return dataset.skip(cap).take(HELD_OUT_DOCS)
+        return dataset.take(HELD_OUT_DOCS)
+
+    total = len(dataset)
+    if cap is not None and cap < total:
+        start, end = cap, min(cap + HELD_OUT_DOCS, total)
+    else:
+        # Either uncapped, or the cap covers the whole corpus so nothing lies
+        # beyond it. Fall back to the front and make training skip.
+        start, end = 0, max(min(HELD_OUT_DOCS, total // 10), 1)
+
+    if split == "train":
+        if start == 0:
+            return dataset.select(range(end, total))
+        return dataset
+    return dataset.select(range(start, end))
 
 
 def _iter_texts(dataset, column: str, limit: int | None):
@@ -265,9 +440,15 @@ def _iter_texts(dataset, column: str, limit: int | None):
     Raises:
         ValueError: If ``column`` is absent, naming what is available instead.
     """
-    for index, example in enumerate(dataset):
-        if limit is not None and index >= limit:
-            return
+    # islice rather than enumerate-and-return: the latter pulls the document at
+    # index `limit` out of the stream before deciding to stop, so the training
+    # stream consumed one document past its cap. It was discarded rather than
+    # tokenized, so nothing was wrong with the output — but it made the boundary
+    # between train and a holdout carved from beyond the cap inexact, which is
+    # not a property to leave approximate.
+    source = dataset if limit is None else itertools.islice(dataset, limit)
+
+    for example in source:
         if column not in example:
             raise ValueError(
                 f"Column {column!r} not found. This dataset has "
@@ -304,27 +485,31 @@ def prepare(config: TrainConfig) -> None:
     out_dir = Path(config.data_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     eos_id = tokenizer.eos_token_id
-    is_local = Path(config.dataset_name).suffix.lower() in LOCAL_SUFFIXES
+
+    # One decision for the whole run: see needs_carving on why per-split is a
+    # leak rather than a style choice.
+    carve = needs_carving(config)
 
     for split, filename in (("train", "train.bin"), ("validation", "val.bin")):
-        dataset = _load_split(config, split)
-        limit = config.max_train_docs if split == "train" else None
-
-        if is_local:
-            # One file, two splits: hold back a slice for validation.
-            if config.streaming:
-                dataset = (
-                    dataset.skip(1_000) if split == "train" else dataset.take(1_000)
-                )
-            else:
-                held_out = min(1_000, len(dataset) // 10)
-                dataset = (
-                    dataset.select(range(held_out, len(dataset)))
-                    if split == "train"
-                    else dataset.select(range(held_out))
-                )
-
         path = out_dir / filename
+
+        # Tokenizing a pretraining corpus takes hours, and a job that dies on
+        # the second split should not throw away the first. A split with a
+        # sidecar finished; one without it did not.
+        if not config.overwrite_data:
+            done = _completed(path, config, len(tokenizer))
+            if done is not None:
+                print(
+                    f"{split:>10} -> {path}  {done:,} tokens  already complete, "
+                    f"skipping (pass --overwrite_data=true to rebuild)"
+                )
+                continue
+
+        dataset, _ = _load_split(config, split, carve)
+        limit = config.max_train_docs if split == "train" else None
+        if carve:
+            dataset = _carve(dataset, split, config)
+
         total = 0
         batch: list[str] = []
 
@@ -349,6 +534,22 @@ def prepare(config: TrainConfig) -> None:
             total += flush(batch)
 
         if total == 0:
+            if carve and split == "validation":
+                raise ValueError(
+                    f"No documents left to be held out for validation. It is "
+                    f"taken from beyond max_train_docs "
+                    f"({config.max_train_docs}), and the corpus appears to end "
+                    f"at or before that. Lower --max_train_docs, or point "
+                    f"--dataset_name at a larger config."
+                )
+            if carve and split == "train":
+                raise ValueError(
+                    f"No documents left for training. With max_train_docs "
+                    f"unset, the first {HELD_OUT_DOCS} documents are held out "
+                    f"for validation, and this corpus has no more than that. "
+                    f"Set --max_train_docs so the holdout is taken from beyond "
+                    f"the training data instead."
+                )
             raise ValueError(
                 f"Split {split!r} produced no tokens. Check --text_column "
                 f"(currently {config.text_column!r})."
@@ -367,6 +568,8 @@ def prepare(config: TrainConfig) -> None:
                     "text_column": config.text_column,
                     "split": split,
                     "max_train_docs": config.max_train_docs,
+                    "derived_from_train": carve,
+                    "held_out_docs": HELD_OUT_DOCS if carve else None,
                 },
                 indent=2,
             )

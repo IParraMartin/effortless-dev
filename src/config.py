@@ -532,7 +532,14 @@ class TrainConfig:
             memory maps produced by ``data.py``.
         seq_len: Tokens per training example.
         max_train_docs: Cap on documents tokenized during preparation, useful
-            for quick experiments. ``None`` uses the whole split.
+            for quick experiments. ``None`` uses the whole split. Also decides
+            where a held-out set is carved from when the corpus ships only a
+            training split: validation is taken from beyond the cap, so the
+            two never overlap.
+        overwrite_data: Re-tokenize splits that are already complete on disk.
+            Preparation is skipped by default for any split whose sidecar
+            matches the current settings, so a job that dies partway can be
+            resubmitted without repeating hours of work.
         batch_size: Examples per micro-batch, per device.
         grad_accum_steps: Micro-batches accumulated before each optimizer step.
             The global batch is ``batch_size * grad_accum_steps * world_size``.
@@ -578,6 +585,7 @@ class TrainConfig:
     data_dir: str = "data"
     seq_len: int = 512
     max_train_docs: int | None = None
+    overwrite_data: bool = False
 
     batch_size: int = 8
     grad_accum_steps: int = 4
