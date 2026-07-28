@@ -19,9 +19,11 @@ Run this module from the repository root to build the files::
 
 from __future__ import annotations
 
+import gc
 import itertools
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -577,9 +579,31 @@ def prepare(config: TrainConfig) -> None:
 
         print(
             f"{split:>10} -> {path}  {total:,} tokens  {dtype.name}  "
-            f"{os.path.getsize(path) / 1e6:.1f} MB"
+            f"{os.path.getsize(path) / 1e6:.1f} MB",
+            flush=True,
         )
+
+        # Drop the reader now. A streaming dataset holds an HTTP session and
+        # background prefetch threads, and leaving them for the interpreter to
+        # collect is what lets one still be fetching a shard at shutdown.
+        del dataset
+        gc.collect()
 
 
 if __name__ == "__main__":
     prepare(parse_into(TrainConfig))
+
+    # Exit without waiting for the interpreter to finalize.
+    #
+    # A streaming reader's background threads can outlive the main thread and
+    # touch the GIL after finalization has started, which aborts the process
+    # with "PyGILState_Release: auto-releasing thread-state". Every file is
+    # written and closed by the time prepare returns, so the work is safe — but
+    # the nonzero exit makes Slurm report a completed job as FAILED, and a job
+    # that lies about its own outcome is worse than one that is slow.
+    #
+    # This is the last statement in the program and the streams are flushed
+    # first, so nothing that had not already run is skipped.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
