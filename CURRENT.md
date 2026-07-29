@@ -9,6 +9,11 @@ a new run lands. Move anything that a later run contradicts into
 *Corrected/retracted* rather than deleting it — a result that was wrong once is
 worth being able to find again.
 
+> **Read this first.** An external review on 2026-07-29 retracted the two
+> headline results below. They have been moved to *Retracted* and are no longer
+> in *Established*. The numbers are unchanged and were not misread; what fails is
+> their attribution. See `DESCRIPTION.md` for the full decision log.
+
 ---
 
 ## Runs
@@ -38,47 +43,6 @@ exit, on the final layer, which is an ordinary language model.
 
 ## Established results
 
-### The sharing tax at full depth is real
-
-Training with six exits cost the final layer roughly **0.075 nats**.
-
-| | depth-12 CE | perplexity |
-|---|---|---|
-| `vr-noexits` (independently trained) | 3.2024 eval / 3.1782 train | 24.59 |
-| `vr-exits` (shared backbone) | 3.2768 eval / 3.2560 train | 26.49 |
-| **tax** | **+0.0744 eval / +0.0778 train** | **+7.7%** |
-
-Two estimates computed by different routes — held-out evaluation, and a
-40-point trailing mean of training CE — agree to within 0.003 nats. The scatter
-on those trailing windows is ±0.05. Train figures use the same trailing mean on
-both arms.
-
-This is a point estimate from one seed. It is **not** the predeclared
-non-inferiority test, which needs the paired per-request bootstrap from
-`jobs/sharing_tax.sh`.
-
-### The depth curve is flat above depth 8
-
-`vr-exits`, trailing-mean training CE:
-
-| depth | 2 | 4 | 6 | 8 | 10 | 12 |
-|---|---|---|---|---|---|---|
-| CE | 4.0547 | 3.4855 | 3.3465 | 3.2997 | 3.2574 | 3.2560 |
-| Δ from previous | — | −0.569 | −0.139 | −0.047 | −0.042 | **−0.001** |
-
-The last two blocks buy 0.0014 nats, well inside the ±0.05 scatter. Depths 10
-and 12 are the same model for practical purposes.
-
-**This is the finding that most affects the research question.** A fixed
-depth-10 endpoint is a strong baseline needing no controller at all: 17% cheaper
-for nothing measurable. The router's gain has to be measured against that, not
-against depth 12. And the shared backbone at depth 10 (3.2574) is still 0.079
-nats behind the independently trained model at depth 12 (3.1782).
-
-The token-level threshold sweep points the same way: `vr-exits` routed at mean
-depth 9.94 (threshold 0.2, 17.1% compute saved) reaches accuracy 0.3470, against
-0.3545 for `vr-noexits` at full depth.
-
 ### K/V memory falls exactly as proved
 
 `04_math_foundations.md` §7 proves cache memory under a request-level depth cap
@@ -92,6 +56,120 @@ The measurement is read from the cache itself and the prediction from
 `AnalyticalCostModel`; the two reach the comparison by separate code paths.
 Reported by `experiments/benchmark_latency.py` under *"K/V memory: does the
 depth cap reach the allocator?"*.
+
+This is the one result in this file that survives the review, and the review is
+right that it is an implementation invariant rather than a research finding: it
+shows the depth cap reaches the allocator. It says nothing about latency,
+throughput or energy, and it is not novel on its own.
+
+---
+
+## Retracted
+
+Neither number below was misread. Both are real properties of the two runs. What
+fails is what they were taken to mean.
+
+### The +0.075 nats is not a sharing tax
+
+**Was:** "The sharing tax at full depth is real."
+
+**Now:** an observation about one run pair, not a causal estimate. Two confounds,
+each confirmed against the code rather than inferred:
+
+1. **The arms did not share a backbone.** Constructing exit modules consumed
+   random draws *before* the global initialization pass, so six exits and one exit
+   under the same seed produced different embeddings and blocks — measured
+   maximum differences around 0.0955 on the embedding and 0.1009 on block 0's
+   query projection. Fixed in `5a8f3fb`; the two runs on disk predate the fix.
+2. **The endpoint was down-weighted.** The legacy objective normalizes across all
+   exits, so at depths 2/4/6/8/10/12 the final endpoint carried
+   `12/42 = 0.2857` of the hard-target coefficient against the final-only arm's
+   `1.0`, and each shallow exit also carried a distillation term at 0.5.
+
+A degraded endpoint is the expected consequence of dividing its coefficient by
+3.5. The pair cannot separate that from gradient interference, from the different
+initialization, or from actual capacity sharing.
+
+**What is still defensible:** under one seed and this specific six-exit,
+linearly-normalized, self-distilled scratch recipe, the final endpoint has higher
+CE than a final-only run at matched token exposure, and the multi-exit run costs
+11.68% more wall clock. That motivates the anchored objective and the retrofit
+ladder. It does not measure what sharing costs.
+
+**What would establish it:** two arms from the same serialized parent
+initialization, same data order, under `--objective_version=anchored_v1` with
+`shallow_loss_weight` at 0 and at a nonzero value. The anchored objective's
+`shallow_loss_weight=0.0` is exactly a final-only run, which is what makes the
+control arm a control.
+
+The numbers, retained:
+
+| | depth-12 CE | perplexity |
+|---|---|---|
+| `vr-noexits` (final-only recipe) | 3.2024 eval / 3.1782 train | 24.59 |
+| `vr-exits` (six-exit recipe) | 3.2768 eval / 3.2560 train | 26.49 |
+| **difference** | **+0.0744 eval / +0.0778 train** | **+7.7%** |
+
+Two estimates by different routes — held-out evaluation, and a 40-point trailing
+mean of training CE — agreeing to within 0.003 nats against ±0.05 scatter. Both
+are also subject to the reduction bug below.
+
+### Depth 10 is not free
+
+**Was:** "A fixed depth-10 endpoint is 17% cheaper for nothing measurable."
+
+**Now:** retracted. Three reasons:
+
+1. Depth 10 and depth 12 are close *inside the six-exit model*, which is the
+   model whose endpoint is degraded. It is not evidence that two blocks are
+   redundant in general.
+2. Depth 10 was trained as an exit, so the flatness may reflect the objective
+   rather than natural redundancy.
+3. The comparison that matters goes the other way: the six-exit depth-10 CE is
+   **0.0792 nats worse** than the final-only model's depth-12 CE
+   (3.2574 − 3.1782), an 8.24% perplexity ratio.
+
+And depth 10 was never scored on held-out data at all — see the aliasing bug
+below.
+
+The curve, retained (`vr-exits`, trailing-mean training CE):
+
+| depth | 2 | 4 | 6 | 8 | 10 | 12 |
+|---|---|---|---|---|---|---|
+| CE | 4.0547 | 3.4855 | 3.3465 | 3.2997 | 3.2574 | 3.2560 |
+| Δ from previous | — | −0.569 | −0.139 | −0.047 | −0.042 | **−0.001** |
+
+The token-level threshold sweep pointed the same way: `vr-exits` routed at mean
+depth 9.94 (threshold 0.2, 17.1% compute saved) reached accuracy 0.3470, against
+0.3545 for `vr-noexits` at full depth.
+
+**What would establish it:** a paired non-inferiority test on held-out data
+between depth-10 and depth-12 readouts within one model, a post-hoc depth-10
+readout on the final-only parent, and an independent model at comparable measured
+cost.
+
+### The held-out CEs describe a shard, not the split
+
+**Was:** eval CE 3.2024 and 3.2768, described as held-out numbers.
+
+**Now:** they are rank zero's validation shard. The validation sampler assigns
+disjoint data per rank and the evaluator returned local losses without an
+all-reduce, while only rank zero logged. If both runs used the same world size,
+sampler and order, the comparison may still be paired over the same subset — but
+it is a smaller and misdescribed sample. Fixed in `5a8f3fb`; both checkpoints need
+re-scoring over the full split.
+
+### Routed compute figures were optimistic by one probe pass
+
+Any routed MAC or realized-compute number produced before `5a8f3fb` understates
+cost. `generate_routed()` ran the shallow probe, discarded it, and recomputed
+those layers from block zero inside the selected tier, while the counters charged
+the probe as reused.
+
+### The step count was an index
+
+38,140 is the zero-based final logging index. `2,499,608,576 / 65,536 = 38,141`
+completed updates. Both fields are now written separately.
 
 ---
 
@@ -134,26 +212,35 @@ built it.
 
 ## Not established
 
-- **The sharing tax has no confidence interval.** One seed per arm, point
-  estimates only. `jobs/sharing_tax.sh` produces the paired per-request
-  bootstrap.
-- **`learnable gain` is unmeasured on real text.** This is the go/no-go number.
-  On the toy workload the plain oracle showed +0.051 of headroom while the
-  reachable ceiling showed +0.008, so 85% of the apparent gain was unreachable
-  by construction. Judging the controller against the plain oracle reports a
-  near-optimal policy as a failure.
-- **Sharing tax at shallow tiers.** `vr-noexits` gives one independent model, at
-  depth 12. Depths 2/4/6/8/10 have no independent counterpart, so they will
-  appear under `sharing_tax_unmatched_tiers`. Measuring them needs the
-  horizontal family.
+- **Nothing about sharing.** See *Retracted*. A causal estimate needs two arms
+  from one serialized parent initialization under `anchored_v1`, with
+  `shallow_loss_weight` at 0 and at a nonzero value. The code for that exists;
+  the runs do not.
+- **No endpoint has been scored on real held-out text.**
+  `collect_depth_trajectories.collect()` still builds `mixed_difficulty_corpus`,
+  a synthetic pattern workload. It is a good mechanism test and it is not
+  evidence about language. A real-text collector is the next piece of work and
+  everything downstream waits on it.
+- **`probe-policy gain` is unmeasured on real text.** This is the go/no-go
+  number. On the toy workload the outcome oracle showed +0.051 of headroom while
+  the cross-fitted probe policy attained +0.008, so 85% of the apparent gain
+  required knowing the answer. Judging the controller against the outcome oracle
+  reports a near-optimal policy as a failure. Both figures are toy-workload
+  numbers.
+- **Sharing tax at shallow tiers.** `vr-noexits` gives one model, at depth 12.
+  Depths 2/4/6/8/10 have no independent counterpart, so they appear under
+  `sharing_tax_unmatched_tiers`. Measuring them needs an independent family.
 - **The K/V propagation strategy has never been trained.**
   `learned_kv_propagation` defaults to `False` and neither run overrode it, so
-  the propagator was inert. It is the token-level (Phase 7) approximation, and
-  §7 notes it materializes all `L` layers and therefore saves no memory. A
-  separate run is required; `experiments/exposure.py` has the arms for it.
+  the propagator was inert. It is the token-level approximation, and §7 notes it
+  materializes all `L` layers and therefore saves no memory. `experiments/exposure.py`
+  has the arms; it is gated behind request-level routing showing headroom.
 - **Latency on serving hardware.** `benchmark_latency` has only been run on a
   toy model on a laptop. It establishes that the measurement is wired up, not
-  what routing is worth.
+  what routing is worth. No continuous batching, no tail latency, no energy.
+- **Retrofit at scale.** The frozen modes preserve the parent bit-identically in
+  tests on a tiny CPU model. The property is structural, so it should hold at
+  scale, but it has not been run there.
 
 ---
 
@@ -172,18 +259,34 @@ built it.
 
 ## Next
 
-```bash
-sbatch --job-name=vr-tax jobs/sharing_tax.sh \
-  checkpoints/vr-exits/final.pt checkpoints/vr-noexits/final.pt
-```
+**Do not run `jobs/sharing_tax.sh` as it stands.** It points real checkpoints at
+`mixed_difficulty_corpus`, a synthetic token pattern, so its confidence intervals
+would be intervals about synthetic data. Real-text trajectory collection comes
+first.
 
-Collects trajectories for both checkpoints under one seed, builds the horizontal
-manifest, fits the controller over three seeds, and evaluates. It returns the
-paired interval around the +0.074 above, and `learnable gain`.
+Then, in order:
 
-Read `learnable gain`, not `oracle − best fixed`. If it is around zero on real
-text, request-level routing has no case and no amount of controller work will
-create one.
+1. **Re-score both checkpoints at every depth** on the same untouched held-out
+   requests, with the global reduction, writing per-document records. This is
+   what replaces the shard-level eval CEs above and gives depths 6, 8 and 10
+   their first held-out numbers.
+2. **Post-hoc readouts on the final-only parent.**
+
+   ```bash
+   python -m experiments.retrofit_parent \
+       --checkpoint checkpoints/vr-noexits/final.pt \
+       --run-dir runs/retrofit-adapter \
+       --mode frozen_exit_adapter --exit_adapter_rank 32 --exit_every 2
+   ```
+
+   The parent's full-depth output is preserved to the bit, so this measures what
+   is decodable from a final-only model's intermediate states with no sharing
+   cost of any kind. If its shallow endpoints match the six-exit model's, sharing
+   was never the binding constraint.
+3. **Common-parent anchored arms**, `--objective_version=anchored_v1` with
+   `--shallow_loss_weight` swept. This is the sharing measurement the first pair
+   could not be.
+4. Only then the controller, and only reading `probe-policy gain`.
 
 ---
 
@@ -202,5 +305,9 @@ PY
 # K/V audit, which runs as part of the latency benchmark.
 python -m experiments.benchmark_latency --out results/latency --device=cpu
 
-python -m unittest discover -s tests -t .   # 184 tests
+# The exit-weight arithmetic behind the retraction above.
+python -c "from src.config import TransformerConfig as C; \
+  print([round(w,6) for w in C(n_layers=12, exit_every=2).exit_weights])"
+
+python -m unittest discover -s tests -t .   # 358 tests
 ```
