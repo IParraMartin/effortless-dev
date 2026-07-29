@@ -54,6 +54,27 @@ from src.routing import (
 from utils.costs import AnalyticalCostModel, CostCounters
 
 
+def _group_of(name: str) -> str:
+    """Names the parameter group a parameter belongs to.
+
+    Args:
+        name: Fully qualified parameter name from ``named_parameters``.
+
+    Returns:
+        ``"embedding"``, ``"block-NN"``, ``"exits"``, or ``"other"``. Blocks are
+        kept separate because gradient conflict is usually localized: a global
+        cosine can be positive while the lower blocks, which every shallow exit
+        reads through, are in opposition.
+    """
+    if name.startswith("blocks."):
+        return f"block-{int(name.split('.')[1]):02d}"
+    if name.startswith("embed"):
+        return "embedding"
+    if name.startswith("exit_modules"):
+        return "exits"
+    return "other"
+
+
 @dataclass
 class ExitOutput:
     """Result of a forward pass.
@@ -71,12 +92,146 @@ class ExitOutput:
             relative to the scale of what they are predicting, or ``None`` when
             learned propagation is off. Values near one mean the adapters are
             no better than predicting zero.
+        full_loss: Detached cross-entropy of the final endpoint on its own.
+            Logged separately from :attr:`loss` because the combined objective
+            is not a cross-entropy and must never be reported as one, and
+            because the no-regret question is about this number specifically.
+        full_weight: Coefficient the final endpoint's cross-entropy carried on
+            this step. Under the legacy objective it shrinks as exits are added;
+            under the anchored objective it is fixed. Logged so a reader can
+            tell which they are looking at without reconstructing the config.
+        distill_losses: Detached distillation term per shallow exit, keyed by
+            layer index, before its weight is applied.
+        preservation_loss: Detached KL from the attached parent's full-depth
+            distribution to this model's, or ``None`` when preservation is off.
+        shallow_alpha: Effective shallow coefficient on this step, after the
+            schedule. Zero on a full-only step of an alternating schedule.
+        selected_exits: Layer indices whose loss was computed on this step.
     """
 
     logits: torch.Tensor
     loss: torch.Tensor | None = None
     exit_losses: dict[int, float] = field(default_factory=dict)
     kv_loss: float | None = None
+    full_loss: float | None = None
+    full_weight: float | None = None
+    distill_losses: dict[int, float] = field(default_factory=dict)
+    preservation_loss: float | None = None
+    shallow_alpha: float | None = None
+    selected_exits: tuple[int, ...] = ()
+
+
+@dataclass
+class ObjectiveTerms:
+    """The training objective, kept in pieces until it has to be one number.
+
+    Assembling the loss inline makes it impossible to ask the two questions
+    that matter about a multi-exit objective: what coefficient did the full
+    endpoint actually carry, and do the shallow gradients oppose it. Keeping the
+    parts separate lets the loop log them and lets
+    :meth:`Transformer.gradient_diagnostics` differentiate them independently
+    without a second forward pass.
+
+    Attributes:
+        full: Cross-entropy of the final endpoint, with gradient attached.
+        full_weight: Its coefficient in the total.
+        shallow: Weighted sum over the shallow exits, already normalized and
+            rescaled for sampling, but before ``alpha``.
+        alpha: Coefficient of that sum on this step, after the schedule.
+        preservation: KL from the frozen parent's full-depth distribution, or
+            ``None`` when preservation is off.
+        preservation_weight: Its coefficient.
+        exit_losses: Detached cross-entropy per scored exit, keyed by layer.
+        distill_losses: Detached distillation term per shallow exit.
+        selected_exits: Layer indices scored on this step.
+    """
+
+    full: torch.Tensor
+    full_weight: float
+    shallow: torch.Tensor
+    alpha: float
+    preservation: torch.Tensor | None
+    preservation_weight: float
+    exit_losses: dict[int, float] = field(default_factory=dict)
+    distill_losses: dict[int, float] = field(default_factory=dict)
+    selected_exits: tuple[int, ...] = ()
+
+    def combined(self) -> torch.Tensor:
+        """Assembles the scalar to optimize.
+
+        Returns:
+            ``full_weight * full + alpha * shallow + preservation_weight *
+            preservation``.
+        """
+        total = self.full_weight * self.full + self.alpha * self.shallow
+        if self.preservation is not None and self.preservation_weight != 0.0:
+            total = total + self.preservation_weight * self.preservation
+        return total
+
+    @property
+    def full_loss(self) -> float:
+        """Detached full-depth cross-entropy, for logging."""
+        return float(self.full.detach())
+
+    @property
+    def preservation_loss(self) -> float | None:
+        """Detached preservation KL, or ``None``."""
+        return None if self.preservation is None else float(self.preservation.detach())
+
+
+@dataclass
+class GradientDiagnostics:
+    """How the shallow objective's gradient relates to the full one's.
+
+    Produced by :meth:`Transformer.gradient_diagnostics`. The point is to
+    measure gradient conflict before reaching for machinery that assumes it:
+    PCGrad, CAGrad and separate optimizers all cost complexity, and none of them
+    is justified by a cosine that turns out to be positive.
+
+    Attributes:
+        full_norm: Norm of the gradient of the full-depth cross-entropy.
+        shallow_norm: Norm of the gradient of the weighted shallow sum, before
+            ``alpha``.
+        norm_ratio: ``shallow_norm / full_norm``. How loud the auxiliary task is
+            relative to the protected one, independent of ``alpha``.
+        cosine: Cosine between the two gradients over all shared parameters.
+            Negative means the shallow objective actively opposes the full one.
+        layer_cosine: Per-group cosine, keyed by parameter group name.
+        layer_norm_ratio: Per-group norm ratio.
+        negative_fraction: Fraction of groups whose cosine is negative. A single
+            global cosine can be positive while most of the backbone is in
+            conflict, which is the case this field exists to expose.
+    """
+
+    full_norm: float
+    shallow_norm: float
+    norm_ratio: float
+    cosine: float
+    layer_cosine: dict[str, float] = field(default_factory=dict)
+    layer_norm_ratio: dict[str, float] = field(default_factory=dict)
+    negative_fraction: float = 0.0
+
+    def report(self) -> str:
+        """Renders the diagnostic as a short table.
+
+        Returns:
+            A multi-line string.
+        """
+        lines = [
+            f"full grad norm      {self.full_norm:.4e}",
+            f"shallow grad norm   {self.shallow_norm:.4e}",
+            f"norm ratio          {self.norm_ratio:.4f}",
+            f"global cosine       {self.cosine:+.4f}",
+            f"groups in conflict  {self.negative_fraction:.1%}",
+            "",
+            f"{'group':<24}{'cosine':>10}{'norm ratio':>14}",
+        ]
+        for name in self.layer_cosine:
+            lines.append(
+                f"{name:<24}{self.layer_cosine[name]:>+10.4f}"
+                f"{self.layer_norm_ratio.get(name, float('nan')):>14.4f}"
+            )
+        return "\n".join(lines)
 
 
 @dataclass
@@ -602,6 +757,13 @@ class Transformer(nn.Module):
         # the new path.
         self.routing: RoutingConfig | None = None
         self.depth_controller: DepthController | None = None
+
+        # A frozen reference for preservation and fixed-teacher distillation,
+        # held inside a list so ``nn.Module.__setattr__`` does not register it as
+        # a submodule. Registering it would put the parent's weights in this
+        # model's state_dict, have DDP try to synchronize parameters that never
+        # receive gradients, and double the checkpoint size.
+        self._parent: list[nn.Module] = []
 
         # Initialize the shared backbone independently of how many exits are
         # attached.  Applying over ``self`` would visit the exit modules too,
@@ -1362,53 +1524,13 @@ class Transformer(nn.Module):
         if targets is None:
             return ExitOutput(logits=final_logits)
 
-        weights = self.config.exit_weights
-        selected = self._select_exits(len(hidden_states))
-        last = len(hidden_states) - 1
-
-        # Scoring a subset shrinks the loss, so the sampled exits stand in for
-        # the ones left out. Redistributing the *total* shallow weight across
-        # whichever exits were picked keeps the objective's scale identical on
-        # every step. Scaling by the plain count ratio instead would also be
-        # correct in expectation, but the weights differ sharply by depth, so
-        # the per-step total would wander and drag gradient clipping and the
-        # learning-rate schedule around with it.
-        sampled = [i for i in selected if i != last]
-        rescale = 1.0
-        if sampled and len(sampled) < last:
-            shallow_total = sum(weights[:last])
-            sampled_total = sum(weights[i] for i in sampled)
-            if shallow_total > 0.0 and sampled_total > 0.0:
-                rescale = shallow_total / sampled_total
-
-        flat_targets = targets.reshape(-1)
-        valid = targets != -100
-        teacher = final_logits.detach() if self.config.self_distill_weight else None
-
-        total = final_logits.new_zeros(())
-        exit_losses: dict[int, float] = {}
-
-        for i in selected:
-            logits = (
-                final_logits if i == last else self._readout(i, hidden_states[i])
-            )
-            layer = self.config.exit_layers[i]
-
-            cross_entropy = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), flat_targets, ignore_index=-100
-            )
-            exit_losses[layer] = float(cross_entropy.detach())
-
-            term = cross_entropy
-            if teacher is not None and i != last:
-                term = term + self.config.self_distill_weight * self._distillation(
-                    logits, teacher, valid
-                )
-
-            weight = weights[i] * (rescale if i != last else 1.0)
-            total = total + weight * term
+        terms = self._objective_terms(
+            input_ids, targets, hidden_states, final_logits
+        )
+        total = terms.combined()
 
         kv_loss = None
+        valid = targets != -100
         if (
             self.config.learned_kv_propagation
             and self.config.kv_propagation_weight != 0.0
@@ -1424,17 +1546,286 @@ class Transformer(nn.Module):
         return ExitOutput(
             logits=final_logits,
             loss=total,
-            exit_losses=exit_losses,
+            exit_losses=terms.exit_losses,
             kv_loss=kv_loss,
+            full_loss=terms.full_loss,
+            full_weight=terms.full_weight,
+            distill_losses=terms.distill_losses,
+            preservation_loss=terms.preservation_loss,
+            shallow_alpha=terms.alpha,
+            selected_exits=terms.selected_exits,
         )
+
+    def attach_parent(self, parent: nn.Module | None) -> None:
+        """Attaches a frozen reference model for preservation and distillation.
+
+        The reference is held outside the module tree, so it does not enter this
+        model's ``state_dict``, is not synchronized by DDP, and does not double
+        the checkpoint. It is put in eval mode and has gradients disabled, which
+        makes it impossible to train the teacher by accident — the failure that
+        turns a preservation term into a slow drift of both models toward each
+        other.
+
+        Args:
+            parent: The reference model, or ``None`` to detach.
+        """
+        if parent is None:
+            self._parent = []
+            return
+        parent.eval()
+        parent.requires_grad_(False)
+        self._parent = [parent]
+
+    @property
+    def parent(self) -> nn.Module | None:
+        """The attached frozen reference, or ``None``."""
+        return self._parent[0] if self._parent else None
+
+    def _parent_logits(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Runs the frozen reference at full depth.
+
+        Args:
+            input_ids: Token ids shaped ``(batch, seq_len)``.
+
+        Returns:
+            The parent's final-layer logits, detached and without dropout.
+
+        Raises:
+            ValueError: If no parent is attached. Preservation against nothing,
+                or distillation from nothing, is a configuration error and not
+                something to silently skip: the run would report a preservation
+                weight it never applied.
+        """
+        parent = self.parent
+        if parent is None:
+            raise ValueError(
+                "this objective needs a frozen parent (preservation_weight > 0 "
+                "or distill_teacher='frozen_parent'), but none is attached. Call "
+                "attach_parent() with the checkpoint named by "
+                "preservation_teacher_checkpoint."
+            )
+        with torch.no_grad():
+            return parent(input_ids).logits.detach()
+
+    def _objective_terms(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor,
+        hidden_states: list[torch.Tensor],
+        final_logits: torch.Tensor,
+    ) -> ObjectiveTerms:
+        """Computes the objective as separately weighted, separately logged parts.
+
+        Two objectives are implemented, selected by
+        ``config.objective_version``:
+
+        ``legacy_normalized`` normalizes every exit weight to sum to one. The
+        final endpoint's coefficient therefore falls as exits are added — to
+        0.2857 at six exits — which makes the full-depth endpoint one task among
+        several. Kept so the runs already on disk remain reproducible.
+
+        ``anchored_v1`` holds the final coefficient at ``full_loss_weight`` and
+        normalizes only over the shallow exits, scaling their sum by
+        ``shallow_alpha(step)``::
+
+            L = w_full * CE_full
+              + alpha(t) * sum_{d<L} w_d * (CE_d + beta * T^2 * KL_d)
+              + gamma * KL(parent_full || this_full)
+
+        Adding an exit then cannot take coefficient away from the endpoint that
+        the no-regret claim is about.
+
+        Args:
+            input_ids: Token ids, needed only by the frozen-parent paths.
+            targets: Gold ids, with ``-100`` marking ignored positions.
+            hidden_states: Residual stream at each exit layer.
+            final_logits: Logits of the deepest exit, with gradient attached.
+
+        Returns:
+            The decomposed terms. ``combined()`` reassembles the scalar to
+            optimize.
+        """
+        config = self.config
+        flat_targets = targets.reshape(-1)
+        valid = targets != -100
+        last = len(hidden_states) - 1
+        step = int(self._step_counter.item())
+
+        full_ce = F.cross_entropy(
+            final_logits.view(-1, final_logits.size(-1)),
+            flat_targets,
+            ignore_index=-100,
+        )
+
+        legacy = config.objective_version == "legacy_normalized"
+        if legacy:
+            weights = config.exit_weights
+            full_weight = weights[last]
+            alpha = 1.0
+            distill_weight = config.self_distill_weight
+            temperature = config.self_distill_temperature
+            teacher_source = "current_full"
+        else:
+            weights = config.shallow_weights
+            full_weight = config.full_loss_weight
+            alpha = config.shallow_alpha(step)
+            distill_weight = config.distill_weight
+            temperature = config.distill_temperature
+            teacher_source = config.distill_teacher
+
+        exit_losses = {config.exit_layers[last]: float(full_ce.detach())}
+        distill_losses: dict[int, float] = {}
+        shallow_terms: list[torch.Tensor] = []
+        selected = self._select_exits(len(hidden_states))
+
+        # With alpha at zero there is nothing for a shallow readout to
+        # contribute, so it is not computed at all. That makes
+        # shallow_loss_weight=0.0 exactly a final-only run -- in gradient, in
+        # memory, and in wall clock -- which is what makes it a usable control.
+        needs_shallow = alpha != 0.0 and last > 0
+        teacher = None
+        if needs_shallow and distill_weight != 0.0:
+            teacher = (
+                self._parent_logits(input_ids)
+                if teacher_source == "frozen_parent"
+                else final_logits.detach()
+            )
+
+        if needs_shallow:
+            sampled = [i for i in selected if i != last]
+            rescale = self._shallow_rescale(sampled, weights, last, legacy)
+            for i in sampled:
+                logits = self._readout(i, hidden_states[i])
+                layer = config.exit_layers[i]
+
+                cross_entropy = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    flat_targets,
+                    ignore_index=-100,
+                )
+                exit_losses[layer] = float(cross_entropy.detach())
+
+                term = cross_entropy
+                if teacher is not None:
+                    divergence = self._distillation(
+                        logits, teacher, valid, temperature, config.distill_top_k
+                    )
+                    distill_losses[layer] = float(divergence.detach())
+                    term = term + distill_weight * divergence
+
+                shallow_terms.append(weights[i] * rescale * term)
+
+        preservation = None
+        if not legacy and config.preservation_weight != 0.0:
+            preservation = self._preservation(
+                final_logits, self._parent_logits(input_ids), valid
+            )
+
+        return ObjectiveTerms(
+            full=full_ce,
+            full_weight=full_weight,
+            shallow=(
+                torch.stack(shallow_terms).sum()
+                if shallow_terms
+                else final_logits.new_zeros(())
+            ),
+            alpha=alpha,
+            preservation=preservation,
+            preservation_weight=config.preservation_weight if not legacy else 0.0,
+            exit_losses=exit_losses,
+            distill_losses=distill_losses,
+            selected_exits=tuple(config.exit_layers[i] for i in selected),
+        )
+
+    def _shallow_rescale(
+        self,
+        sampled: list[int],
+        weights: tuple[float, ...],
+        last: int,
+        legacy: bool,
+    ) -> float:
+        """Scales a capped step's shallow exits to stand in for the whole set.
+
+        ``exits_per_step`` scores only some shallow exits, so the sum has to be
+        corrected or the shallow objective quietly shrinks in proportion.
+
+        Two corrections are available, and they are not equivalent:
+
+        ``unbiased`` multiplies by ``n_shallow / n_sampled``. The rotation
+        covers every shallow exit exactly ``budget`` times in ``n_shallow``
+        consecutive steps, so each exit's coefficient averages to its own
+        weight over one rotation, and the averaged gradient equals that of
+        scoring every exit. This is the anchored default.
+
+        ``fixed_total`` redistributes the entire shallow weight across whichever
+        exits were sampled, holding the per-step objective scale constant so
+        gradient clipping and the learning-rate schedule see a steady loss. It is
+        biased: the weights differ sharply by depth, so an exit sampled next to a
+        heavy one is systematically discounted. It is the legacy behaviour.
+
+        Args:
+            sampled: Positions of the shallow exits scored on this step.
+            weights: Per-exit weights for the active objective.
+            last: Position of the final exit.
+            legacy: Whether the legacy objective is in force, which pins the
+                estimator to ``fixed_total`` regardless of configuration.
+
+        Returns:
+            The multiplier to apply to every sampled shallow weight.
+        """
+        if not sampled or len(sampled) >= last:
+            return 1.0
+
+        estimator = "fixed_total" if legacy else self.config.shallow_estimator
+        if estimator == "unbiased":
+            return last / len(sampled)
+
+        shallow_total = sum(weights[:last])
+        sampled_total = sum(weights[i] for i in sampled)
+        if shallow_total <= 0.0 or sampled_total <= 0.0:
+            return 1.0
+        return shallow_total / sampled_total
+
+    def _preservation(
+        self,
+        logits: torch.Tensor,
+        parent_logits: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Measures how far the full endpoint has moved from its parent.
+
+        The direction is ``KL(parent || this)``: the parent is the reference
+        distribution and this model is penalized for withdrawing mass the parent
+        assigned. Temperature is fixed at one, because unlike distillation this
+        term is not trying to transfer a ranking over unlikely tokens — it is
+        trying to keep a distribution in place.
+
+        Args:
+            logits: This model's final-layer logits, with gradient attached.
+            parent_logits: The frozen parent's, detached.
+            valid: Positions that are not padding.
+
+        Returns:
+            A scalar. Zero exactly when the two distributions agree, which is
+            what makes it usable as a no-regret guardrail during training rather
+            than only at evaluation.
+        """
+        student = F.log_softmax(logits.float(), dim=-1)
+        reference = F.log_softmax(parent_logits.float(), dim=-1)
+        divergence = F.kl_div(
+            student, reference, log_target=True, reduction="none"
+        ).sum(dim=-1)
+        return (divergence * valid).sum() / valid.sum().clamp(min=1)
 
     def _distillation(
         self,
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         valid: torch.Tensor,
+        temperature: float | None = None,
+        top_k: int | None = None,
     ) -> torch.Tensor:
-        """Measures how far an exit is from the final layer's distribution.
+        """Measures how far an exit is from the teacher's distribution.
 
         Uses the forward KL from teacher to student, which penalizes a student
         for putting no mass where the teacher puts some. That direction is what
@@ -1445,23 +1836,222 @@ class Transformer(nn.Module):
         Args:
             student_logits: Shallow exit's logits, shaped
                 ``(batch, seq_len, vocab_size)``.
-            teacher_logits: Detached final-layer logits, same shape.
+            teacher_logits: Detached teacher logits, same shape. Either this
+                model's own final layer or an attached frozen parent.
             valid: Positions that are not padding, shaped ``(batch, seq_len)``.
+            temperature: Softmax temperature. Defaults to
+                ``config.self_distill_temperature``.
+            top_k: Restrict the sum to the teacher's ``top_k`` tokens, pooling
+                the rest into one bucket so both distributions still normalize.
+                ``None`` uses the whole vocabulary. This is an approximation and
+                is reported as one: it changes the objective, not just its cost.
 
         Returns:
             A scalar, already scaled by the squared temperature so its gradient
             stays comparable to the cross-entropy term as the temperature
             changes.
         """
-        temperature = self.config.self_distill_temperature
+        temperature = (
+            self.config.self_distill_temperature if temperature is None else temperature
+        )
         student = F.log_softmax(student_logits / temperature, dim=-1)
         teacher = F.log_softmax(teacher_logits / temperature, dim=-1)
+
+        if top_k is not None and top_k < teacher.size(-1):
+            teacher, student = self._pool_tail(teacher, student, top_k)
 
         divergence = F.kl_div(
             student, teacher, log_target=True, reduction="none"
         ).sum(dim=-1)
         divergence = (divergence * valid).sum() / valid.sum().clamp(min=1)
         return divergence * temperature**2
+
+    @staticmethod
+    def _pool_tail(
+        teacher: torch.Tensor,
+        student: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduces both distributions to the teacher's top-k plus one bucket.
+
+        Truncating to top-k and renormalizing would let the student put
+        unlimited mass outside the kept set for free. Pooling the remainder into
+        a single category keeps both distributions normalized, so the divergence
+        still penalizes a student that escapes into the tail — it just stops
+        distinguishing between the tail's members.
+
+        Args:
+            teacher: Teacher log-probabilities over the vocabulary.
+            student: Student log-probabilities, same shape.
+            top_k: Number of teacher-ranked tokens to keep distinct.
+
+        Returns:
+            A tuple of ``(teacher, student)`` log-probabilities over ``top_k +
+            1`` categories, the last being the pooled remainder.
+        """
+        _, indices = teacher.topk(top_k, dim=-1)
+        kept_teacher = teacher.gather(-1, indices)
+        kept_student = student.gather(-1, indices)
+
+        # log(1 - sum(kept)) via logsumexp, clamped away from log(0) for the
+        # case where the top-k already holds essentially all the mass.
+        def remainder(kept: torch.Tensor) -> torch.Tensor:
+            mass = kept.logsumexp(dim=-1, keepdim=True).exp().clamp(max=1.0 - 1e-6)
+            return (1.0 - mass).log()
+
+        teacher_pooled = torch.cat([kept_teacher, remainder(kept_teacher)], dim=-1)
+        student_pooled = torch.cat([kept_student, remainder(kept_student)], dim=-1)
+        return teacher_pooled, student_pooled
+
+    def gradient_diagnostics(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor,
+        groups: bool = True,
+    ) -> GradientDiagnostics:
+        """Measures conflict between the full and shallow objectives.
+
+        Multi-objective machinery — PCGrad, CAGrad, separate optimizers — is
+        only justified by conflict that has been observed. This differentiates
+        the two terms of the same forward pass against the same parameters and
+        reports how they relate, so the decision rests on a number.
+
+        Every shallow exit is scored regardless of ``exits_per_step``, since a
+        rotating subset would make the answer depend on which step it was asked
+        on. That makes this expensive: it is a diagnostic to run periodically,
+        not every step.
+
+        Args:
+            input_ids: Token ids shaped ``(batch, seq_len)``.
+            targets: Gold ids of the same shape.
+            groups: Whether to compute per-group cosines. Groups are the
+                embedding, each block, and the exit modules.
+
+        Returns:
+            The diagnostic. Gradients are obtained with
+            :func:`torch.autograd.grad`, so no ``.grad`` field is touched and
+            the caller's accumulated gradients survive.
+
+        Raises:
+            ValueError: If the model has no shallow exits, leaving nothing to
+                compare the full objective against.
+        """
+        if len(self.config.exit_layers) < 2:
+            raise ValueError(
+                "gradient_diagnostics needs at least one shallow exit; a "
+                "single-exit model has no auxiliary objective to conflict with."
+            )
+
+        was_training = self.training
+        self.eval()  # no dropout, so both terms see the same activations
+        try:
+            with self.score_all_exits():
+                all_hidden = self._run_blocks(input_ids, 0, None)
+                hidden_states = [
+                    all_hidden[layer] for layer in self.config.exit_layers
+                ]
+                final_logits = self._readout(
+                    len(self.exit_modules) - 1, hidden_states[-1]
+                )
+                terms = self._objective_terms(
+                    input_ids, targets, hidden_states, final_logits
+                )
+
+            named = [
+                (name, parameter)
+                for name, parameter in self.named_parameters()
+                if parameter.requires_grad
+            ]
+            parameters = [parameter for _, parameter in named]
+            full_grads = torch.autograd.grad(
+                terms.full, parameters, retain_graph=True, allow_unused=True
+            )
+            shallow_grads = torch.autograd.grad(
+                terms.shallow, parameters, retain_graph=False, allow_unused=True
+            )
+        finally:
+            self.train(was_training)
+
+        return self._summarize_gradients(
+            named, full_grads, shallow_grads, groups=groups
+        )
+
+    def _summarize_gradients(
+        self,
+        named: list[tuple[str, torch.Tensor]],
+        full_grads: tuple[torch.Tensor | None, ...],
+        shallow_grads: tuple[torch.Tensor | None, ...],
+        groups: bool,
+    ) -> GradientDiagnostics:
+        """Reduces two gradient lists to the reported statistics.
+
+        Args:
+            named: Parameter names paired with the parameters themselves.
+            full_grads: Gradient of the full objective, aligned with ``named``.
+                Entries are ``None`` where a parameter received none.
+            shallow_grads: Gradient of the shallow objective, likewise.
+            groups: Whether to compute per-group statistics.
+
+        Returns:
+            The populated diagnostic.
+        """
+
+        def flatten(grads, indices) -> torch.Tensor:
+            # A parameter one objective reaches and the other does not becomes a
+            # block of zeros, not a gap. Dropping it would misalign the two
+            # vectors and make the cosine compare unrelated coordinates.
+            pieces = [
+                (
+                    grads[i].detach().reshape(-1).double()
+                    if grads[i] is not None
+                    else torch.zeros(named[i][1].numel(), dtype=torch.float64)
+                )
+                for i in indices
+            ]
+            return torch.cat(pieces) if pieces else torch.zeros(1, dtype=torch.float64)
+
+        def cosine(left: torch.Tensor, right: torch.Tensor) -> float:
+            scale = left.norm() * right.norm()
+            if float(scale) == 0.0:
+                return float("nan")
+            return float(left.dot(right) / scale)
+
+        everything = range(len(named))
+        full_flat = flatten(full_grads, everything)
+        shallow_flat = flatten(shallow_grads, everything)
+        full_norm, shallow_norm = float(full_flat.norm()), float(shallow_flat.norm())
+
+        layer_cosine: dict[str, float] = {}
+        layer_norm_ratio: dict[str, float] = {}
+        if groups:
+            buckets: dict[str, list[int]] = {}
+            for index, (name, _) in enumerate(named):
+                buckets.setdefault(_group_of(name), []).append(index)
+            for group, indices in sorted(buckets.items()):
+                left = flatten(full_grads, indices)
+                right = flatten(shallow_grads, indices)
+                layer_cosine[group] = cosine(left, right)
+                denominator = float(left.norm())
+                layer_norm_ratio[group] = (
+                    float(right.norm()) / denominator
+                    if denominator > 0.0
+                    else float("nan")
+                )
+
+        finite = [value for value in layer_cosine.values() if value == value]
+        return GradientDiagnostics(
+            full_norm=full_norm,
+            shallow_norm=shallow_norm,
+            norm_ratio=shallow_norm / full_norm if full_norm > 0.0 else float("nan"),
+            cosine=cosine(full_flat, shallow_flat),
+            layer_cosine=layer_cosine,
+            layer_norm_ratio=layer_norm_ratio,
+            negative_fraction=(
+                sum(1 for value in finite if value < 0.0) / len(finite)
+                if finite
+                else 0.0
+            ),
+        )
 
     @torch.no_grad()
     def exit_statistics(

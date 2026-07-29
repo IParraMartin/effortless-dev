@@ -15,6 +15,7 @@ can be reconfigured without editing code.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from dataclasses import MISSING, dataclass, fields, replace
 from typing import TypeVar
@@ -24,6 +25,45 @@ EXIT_CRITERIA = ("entropy", "max_prob", "top2_margin")
 
 #: Schemes accepted by ``exit_loss_weighting``.
 EXIT_WEIGHTINGS = ("linear", "uniform", "final_only")
+
+#: Objectives accepted by ``objective_version``.
+#:
+#: ``legacy_normalized`` is the objective the first two Savio arms trained
+#: under. It normalizes every exit weight to sum to one, so at depths
+#: 2/4/6/8/10/12 the final endpoint receives 12/42 = 0.2857 of the hard-target
+#: coefficient and the shallow exits receive the other 0.7143. That makes the
+#: full endpoint one task among six rather than the protected one, which is why
+#: its degradation in those runs cannot be attributed to parameter sharing.
+#: Retained so those runs stay reproducible.
+#:
+#: ``anchored_v1`` fixes the full-depth coefficient at ``full_loss_weight`` and
+#: normalizes only over the shallow exits, scaling their total by
+#: ``shallow_loss_weight``. The full objective is then never diluted by adding
+#: an exit, and the strength of the auxiliary task is one number that can be
+#: swept.
+OBJECTIVE_VERSIONS = ("legacy_normalized", "anchored_v1")
+
+#: Schedules accepted by ``shallow_loss_schedule``.
+SHALLOW_SCHEDULES = ("constant", "linear_warmup", "cosine_ramp", "alternating")
+
+#: Schemes accepted by ``shallow_weighting``.
+SHALLOW_WEIGHTINGS = ("uniform", "linear", "custom")
+
+#: Estimators accepted by ``shallow_estimator`` when ``exits_per_step`` caps
+#: how many shallow exits a step scores.
+#:
+#: ``unbiased`` scales the sampled exits by ``n_shallow / n_sampled``, so each
+#: exit's expected coefficient over a full rotation equals its weight. This is
+#: the estimator whose averaged gradient matches scoring every exit.
+#:
+#: ``fixed_total`` redistributes the whole shallow weight across whichever exits
+#: were picked, holding the per-step objective scale constant. That is easier on
+#: gradient clipping but biased: an exit that happens to be sampled alongside a
+#: heavy one is systematically down-weighted.
+SHALLOW_ESTIMATORS = ("unbiased", "fixed_total")
+
+#: Teachers accepted by ``distill_teacher``.
+DISTILL_TEACHERS = ("current_full", "frozen_parent")
 
 #: Schemes accepted by ``kv_exposure``.
 KV_EXPOSURES = ("teacher", "simulated")
@@ -124,6 +164,61 @@ class TransformerConfig:
             many steps, re-anchoring the residual stream and writing exact keys
             and values at that position. ``0`` disables it. Intended as a
             mitigation for drift accumulating over long generations.
+        objective_version: Which multi-exit objective to optimize. One of
+            :data:`OBJECTIVE_VERSIONS`. The default reproduces the runs already
+            on disk; ``"anchored_v1"`` is the objective new causal arms should
+            use. The fields below from ``full_loss_weight`` through
+            ``preservation_teacher_checkpoint`` apply only to ``anchored_v1``
+            and are ignored by the legacy objective, which reads
+            ``exit_loss_weighting``, ``self_distill_weight`` and
+            ``self_distill_temperature`` instead.
+        full_loss_weight: Coefficient of the full-depth cross-entropy. Held at
+            one by default and never renormalized when exits are added, which
+            is the whole point of the anchored form.
+        shallow_loss_weight: Total strength of the shallow objective, the
+            ``alpha`` of the anchored loss. ``0`` reproduces a final-only run
+            exactly, which makes it the natural control arm.
+        shallow_loss_schedule: How ``shallow_loss_weight`` varies with the step.
+            One of :data:`SHALLOW_SCHEDULES`. ``"linear_warmup"`` and
+            ``"cosine_ramp"`` reach the full value at
+            ``shallow_loss_warmup_steps``, letting the representation form
+            around the full task first. ``"alternating"`` applies the shallow
+            term on odd steps only, which halves how often shallow gradients
+            reach the backbone and lowers peak memory.
+        shallow_loss_warmup_steps: Steps the ramping schedules take to reach
+            ``shallow_loss_weight``.
+        shallow_weighting: How the shallow total is split across depths. One of
+            :data:`SHALLOW_WEIGHTINGS`. Normalized over shallow exits only.
+        shallow_custom_weights: Explicit depth-to-weight mapping used when
+            ``shallow_weighting`` is ``"custom"``. Keys are depths — executed
+            block counts, so ``layer_index + 1`` — and must cover every shallow
+            exit exactly. Normalized internally, so the values need only be
+            proportional.
+        shallow_estimator: How a capped step stands in for the exits it did not
+            score. One of :data:`SHALLOW_ESTIMATORS`.
+        distill_weight: Strength of the distillation term inside each shallow
+            exit's loss, the ``beta`` of the anchored loss.
+        distill_temperature: Softmax temperature for that term. The loss is
+            multiplied by its square, the usual convention that keeps the
+            gradient scale comparable to the cross-entropy as the temperature
+            changes.
+        distill_teacher: Which distribution the shallow exits imitate. One of
+            :data:`DISTILL_TEACHERS`. ``"current_full"`` uses this model's own
+            detached final layer. ``"frozen_parent"`` uses the reference
+            attached by :meth:`Transformer.attach_parent`, which is the right
+            choice for a retrofit: the target does not move as the retrofit
+            proceeds.
+        distill_top_k: Restrict the distillation term to the teacher's top-k
+            tokens, with the remaining mass pooled into one bucket. ``None``
+            uses the whole vocabulary. Cheaper at large vocabularies, and an
+            approximation that must be reported as one.
+        preservation_weight: Strength of the term holding this model's
+            full-depth distribution near the attached parent's. Zero disables
+            it. Nonzero requires a parent reference, since there is otherwise
+            nothing to preserve against.
+        preservation_teacher_checkpoint: Path recorded for provenance so a run
+            states which parent it preserved against. Loading is the caller's
+            job; the model only holds the reference.
     """
 
     vocab_size: int = 52_000
@@ -154,6 +249,21 @@ class TransformerConfig:
     kv_propagation_weight: float = 1.0
     kv_exposure: str = "teacher"
     refresh_every: int = 0
+
+    objective_version: str = "legacy_normalized"
+    full_loss_weight: float = 1.0
+    shallow_loss_weight: float = 0.0
+    shallow_loss_schedule: str = "constant"
+    shallow_loss_warmup_steps: int = 0
+    shallow_weighting: str = "linear"
+    shallow_custom_weights: dict[int, float] | None = None
+    shallow_estimator: str = "unbiased"
+    distill_weight: float = 0.0
+    distill_temperature: float = 2.0
+    distill_teacher: str = "current_full"
+    distill_top_k: int | None = None
+    preservation_weight: float = 0.0
+    preservation_teacher_checkpoint: str | None = None
 
     def __post_init__(self) -> None:
         """Fills in derived fields and validates the configuration.
@@ -225,6 +335,107 @@ class TransformerConfig:
                 f"{self.exits_per_step}."
             )
 
+        self._validate_objective()
+
+    def _validate_objective(self) -> None:
+        """Checks the anchored objective's fields.
+
+        Raises:
+            ValueError: If a name is unrecognized, a weight is negative, a
+                temperature is not positive, the custom weights do not cover
+                exactly the shallow depths or do not sum to something positive,
+                or preservation is requested without a checkpoint to record.
+        """
+        for name, allowed in (
+            ("objective_version", OBJECTIVE_VERSIONS),
+            ("shallow_loss_schedule", SHALLOW_SCHEDULES),
+            ("shallow_weighting", SHALLOW_WEIGHTINGS),
+            ("shallow_estimator", SHALLOW_ESTIMATORS),
+            ("distill_teacher", DISTILL_TEACHERS),
+        ):
+            value = getattr(self, name)
+            if value not in allowed:
+                raise ValueError(
+                    f"{name} must be one of {allowed}, got {value!r}."
+                )
+
+        for name in ("full_loss_weight", "shallow_loss_weight", "distill_weight",
+                     "preservation_weight"):
+            value = getattr(self, name)
+            if value < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value}.")
+
+        if self.distill_temperature <= 0.0:
+            raise ValueError(
+                f"distill_temperature must be positive, got "
+                f"{self.distill_temperature}."
+            )
+        if self.shallow_loss_warmup_steps < 0:
+            raise ValueError(
+                "shallow_loss_warmup_steps must be non-negative, got "
+                f"{self.shallow_loss_warmup_steps}."
+            )
+        if self.shallow_loss_schedule in ("linear_warmup", "cosine_ramp") and (
+            self.shallow_loss_warmup_steps == 0
+        ):
+            raise ValueError(
+                f"shallow_loss_schedule={self.shallow_loss_schedule!r} needs "
+                f"shallow_loss_warmup_steps > 0; with zero it is indistinguishable "
+                f"from 'constant', and a run whose schedule is a no-op should say "
+                f"'constant' so its record is readable."
+            )
+        if self.distill_top_k is not None and self.distill_top_k < 1:
+            raise ValueError(
+                f"distill_top_k must be positive or None, got {self.distill_top_k}."
+            )
+
+        if self.shallow_weighting == "custom":
+            self._validate_custom_weights()
+        elif self.shallow_custom_weights is not None:
+            raise ValueError(
+                "shallow_custom_weights was supplied but shallow_weighting is "
+                f"{self.shallow_weighting!r}. Set shallow_weighting='custom' to use "
+                f"them, rather than having them silently ignored."
+            )
+
+    def _validate_custom_weights(self) -> None:
+        """Checks that custom shallow weights cover exactly the shallow depths.
+
+        Raises:
+            ValueError: If the mapping is absent, misses a shallow depth, names
+                a depth that carries no exit, contains a negative value, or sums
+                to zero.
+        """
+        if not self.shallow_custom_weights:
+            raise ValueError(
+                "shallow_weighting='custom' requires shallow_custom_weights, "
+                "a mapping from depth to weight."
+            )
+
+        # Keys may arrive as strings from JSON or a command line.
+        supplied = {int(depth): float(w) for depth, w in
+                    self.shallow_custom_weights.items()}
+        self.shallow_custom_weights = supplied
+
+        expected = {layer + 1 for layer in self.exit_layers[:-1]}
+        if set(supplied) != expected:
+            raise ValueError(
+                f"shallow_custom_weights must name exactly the shallow depths "
+                f"{sorted(expected)}, got {sorted(supplied)}. A depth left out "
+                f"would be trained at weight zero without saying so, and a depth "
+                f"named that carries no exit would be silently dropped."
+            )
+        negative = {d: w for d, w in supplied.items() if w < 0.0}
+        if negative:
+            raise ValueError(
+                f"shallow_custom_weights must be non-negative, got {negative}."
+            )
+        if sum(supplied.values()) <= 0.0:
+            raise ValueError(
+                "shallow_custom_weights must sum to something positive; all "
+                "zeros should be expressed as shallow_loss_weight=0.0."
+            )
+
     @property
     def head_dim(self) -> int:
         """Dimensionality of a single attention head."""
@@ -286,6 +497,70 @@ class TransformerConfig:
 
         total = sum(raw)
         return tuple(value / total for value in raw)
+
+    @property
+    def shallow_weights(self) -> tuple[float, ...]:
+        """Anchored shallow weights, normalized over the shallow exits alone.
+
+        This is the difference the anchored objective turns on. The legacy
+        :attr:`exit_weights` normalizes across *all* exits, so adding a shallow
+        exit takes coefficient away from the final one: at depths 2/4/6/8/10/12
+        the final endpoint keeps 0.2857 of the hard-target weight. Here the
+        final entry is zero — its coefficient is :attr:`full_loss_weight`,
+        applied separately and never divided — and the shallow entries sum to
+        one, so ``shallow_loss_weight`` alone controls how loud the auxiliary
+        task is.
+
+        Returns:
+            One weight per entry of :attr:`exit_layers`, ending in ``0.0``, with
+            the remaining entries summing to ``1.0``. A model with a single exit
+            has no shallow exits and returns ``(0.0,)``.
+        """
+        layers = self.exit_layers
+        shallow = layers[:-1]
+        if not shallow:
+            return (0.0,)
+
+        if self.shallow_weighting == "uniform":
+            raw = [1.0] * len(shallow)
+        elif self.shallow_weighting == "linear":
+            raw = [float(layer + 1) for layer in shallow]
+        else:  # "custom", validated to cover exactly these depths
+            raw = [float(self.shallow_custom_weights[layer + 1]) for layer in shallow]
+
+        total = sum(raw)
+        return tuple([value / total for value in raw] + [0.0])
+
+    def shallow_alpha(self, step: int) -> float:
+        """Strength of the shallow objective at a given optimizer step.
+
+        Args:
+            step: Zero-based step index.
+
+        Returns:
+            The coefficient multiplying the normalized shallow sum. ``constant``
+            ignores the step. ``linear_warmup`` and ``cosine_ramp`` rise from
+            zero to :attr:`shallow_loss_weight` over
+            :attr:`shallow_loss_warmup_steps`, so the representation forms
+            around the full task before intermediate decodability is demanded.
+            ``alternating`` returns the full weight on odd steps and zero on
+            even ones, which preserves genuinely full-objective updates and
+            lowers peak memory because shallow logits are not materialized every
+            step.
+        """
+        target = self.shallow_loss_weight
+        if target == 0.0 or self.shallow_loss_schedule == "constant":
+            return target
+        if self.shallow_loss_schedule == "alternating":
+            return target if step % 2 == 1 else 0.0
+
+        span = max(self.shallow_loss_warmup_steps, 1)
+        progress = min(max(step, 0) / span, 1.0)
+        if self.shallow_loss_schedule == "linear_warmup":
+            return target * progress
+        # cosine_ramp: slower at the start, so the first shallow gradients
+        # arrive gently rather than as a step change.
+        return target * 0.5 * (1.0 - math.cos(math.pi * progress))
 
 
 @dataclass
@@ -578,6 +853,11 @@ class TrainConfig:
         eval_every: Steps between validation passes.
         eval_steps: Validation batches per pass.
         sweep_every: Steps between exit-threshold sweeps. ``0`` disables them.
+        grad_diagnostics_every: Steps between gradient-conflict diagnostics.
+            ``0``, the default, disables them. Each one costs an extra forward
+            and two backward passes with every exit scored, so it is a periodic
+            probe rather than per-step instrumentation. Its purpose is to decide
+            whether gradient-surgery machinery is warranted before adding any.
         log_every: Steps between training log lines.
         wandb_project: Weights & Biases project to log to. Leaving this unset
             disables tracking entirely, and the ``wandb`` package is then not
@@ -628,6 +908,7 @@ class TrainConfig:
     eval_every: int = 500
     eval_steps: int = 50
     sweep_every: int = 2000
+    grad_diagnostics_every: int = 0
     log_every: int = 10
 
     wandb_project: str | None = None
@@ -716,6 +997,16 @@ def _add_field_argument(parser: argparse.ArgumentParser, name: str, kind: object
             type=lambda value: value.lower() in ("1", "true", "yes"),
             default=default,
             metavar="BOOL",
+        )
+    elif "dict" in annotation:
+        # JSON, so a mapping is expressible on one command line and lands in the
+        # run record in the same form it was typed:
+        #   --shallow_custom_weights='{"2": 1, "4": 2}'
+        parser.add_argument(
+            flag,
+            type=lambda value: None if value.lower() == "none" else json.loads(value),
+            default=default,
+            metavar="JSON",
         )
     elif "int" in annotation:
         parser.add_argument(

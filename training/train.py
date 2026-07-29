@@ -29,6 +29,7 @@ Note:
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from contextlib import nullcontext
@@ -555,6 +556,15 @@ def main(
         exit_totals = torch.zeros(len(exit_layers), device=device)
         exit_counts = torch.zeros(len(exit_layers), device=device)
         kv_running = torch.zeros((), device=device)
+        # Tracked apart from the combined objective. The combined value is not a
+        # cross-entropy and must not be reported as one, and the no-regret
+        # question is about the full endpoint's own CE specifically.
+        full_running = torch.zeros((), device=device)
+        distill_totals = torch.zeros(len(exit_layers), device=device)
+        distill_counts = torch.zeros(len(exit_layers), device=device)
+        preservation_running = torch.zeros((), device=device)
+        step_alpha, step_full_weight = 0.0, 0.0
+        has_preservation = False
 
         for micro in range(train_config.grad_accum_steps):
             inputs, targets = next(batches)
@@ -574,10 +584,24 @@ def main(
             running += loss.detach()
             if out.kv_loss is not None:
                 kv_running += out.kv_loss / train_config.grad_accum_steps
+            if out.full_loss is not None:
+                full_running += out.full_loss / train_config.grad_accum_steps
+            if out.preservation_loss is not None:
+                preservation_running += (
+                    out.preservation_loss / train_config.grad_accum_steps
+                )
+                has_preservation = True
+            if out.shallow_alpha is not None:
+                step_alpha = out.shallow_alpha
+            if out.full_weight is not None:
+                step_full_weight = out.full_weight
             for i, layer in enumerate(exit_layers):
                 if layer in out.exit_losses:
                     exit_totals[i] += out.exit_losses[layer]
                     exit_counts[i] += 1
+                if layer in out.distill_losses:
+                    distill_totals[i] += out.distill_losses[layer]
+                    distill_counts[i] += 1
 
         if train_config.grad_clip > 0:
             scaler.unscale_(optimizer)
@@ -598,6 +622,12 @@ def main(
             totals = distributed.reduce_mean(exit_totals, context)
             counts = distributed.reduce_mean(exit_counts, context)
             kv_mean = float(distributed.reduce_mean(kv_running, context))
+            full_mean = float(distributed.reduce_mean(full_running, context))
+            distill_sums = distributed.reduce_mean(distill_totals, context)
+            distill_seen = distributed.reduce_mean(distill_counts, context)
+            preservation_mean = float(
+                distributed.reduce_mean(preservation_running, context)
+            )
 
             if context.is_main:
                 per_exit = " ".join(
@@ -615,10 +645,22 @@ def main(
                 )
 
                 metrics = {
+                    # Deliberately not called "ce": under either objective this
+                    # is a weighted sum of several terms.
+                    "train/objective": mean_loss,
                     "train/loss": mean_loss,
+                    "train/full_ce": full_mean,
+                    "train/full_weight": step_full_weight,
+                    "train/shallow_alpha": step_alpha,
+                    "train/grad_clip": train_config.grad_clip,
                     "train/lr": lr,
                     "train/tokens": (step + 1) * tokens_per_step,
                     "train/tokens_per_sec": throughput,
+                    **(
+                        {"train/preservation_kl": preservation_mean}
+                        if has_preservation
+                        else {}
+                    ),
                     **(
                         {"train/kv_reconstruction": kv_mean}
                         if model_config.learned_kv_propagation
@@ -635,11 +677,24 @@ def main(
                         {
                             "global_step_index": step,
                             "completed_updates": step + 1,
+                            "objective_version": model_config.objective_version,
+                            "scored_exits": [
+                                layer
+                                for i, layer in enumerate(exit_layers)
+                                if counts[i] > 0
+                            ],
                             **metrics,
                             **{
                                 f"train/exit_ce_L{layer}": float(totals[i] / counts[i])
                                 for i, layer in enumerate(exit_layers)
                                 if counts[i] > 0
+                            },
+                            **{
+                                f"train/distill_L{layer}": float(
+                                    distill_sums[i] / distill_seen[i]
+                                )
+                                for i, layer in enumerate(exit_layers)
+                                if distill_seen[i] > 0
                             },
                         }
                     )
@@ -702,6 +757,22 @@ def main(
                         }
                     )
 
+        if (
+            train_config.grad_diagnostics_every
+            and completed % train_config.grad_diagnostics_every == 0
+            and len(exit_layers) > 1
+        ):
+            _report_gradient_conflict(
+                raw_model,
+                val_loader,
+                device,
+                context,
+                tracker,
+                artifacts,
+                step,
+                completed,
+            )
+
         if train_config.sweep_every and completed % train_config.sweep_every == 0:
             _report_sweep(
                 raw_model, val_loader, model_config, device, context, tracker, step
@@ -750,6 +821,74 @@ def main(
 
     tracker.finish()
     distributed.cleanup(context)
+
+
+def _report_gradient_conflict(
+    model: Transformer,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    context: distributed.DistributedContext,
+    tracker: RunTracker | None,
+    artifacts: RunArtifacts | None,
+    step: int,
+    completed: int,
+) -> None:
+    """Measures and records how the shallow objective opposes the full one.
+
+    This is the evidence that decides whether gradient-surgery machinery is
+    warranted. Adding PCGrad or a compromise gradient before knowing the cosine
+    is adding complexity on a guess, and the simplest method that clears the
+    no-regret gate should win.
+
+    Args:
+        model: The unwrapped model.
+        loader: Loader to draw one held-out batch from.
+        device: Device to move the batch to.
+        context: Distribution context; only the main process measures, since the
+            diagnostic is descriptive and one rank's batch answers the question.
+        tracker: Optional experiment tracker.
+        artifacts: Optional run directory, which receives the full per-group
+            record. The scalars go to the tracker; the layerwise table is too
+            wide for a dashboard and belongs in the raw records.
+        step: Zero-based step index, for the tracker's x-axis.
+        completed: Number of completed updates, for the record.
+    """
+    if not context.is_main:
+        return
+
+    inputs, targets = next(iter(loader))
+    diagnostics = model.gradient_diagnostics(inputs.to(device), targets.to(device))
+
+    print(
+        f"  grad  cosine {diagnostics.cosine:+.4f}  "
+        f"shallow/full norm {diagnostics.norm_ratio:.3f}  "
+        f"groups in conflict {diagnostics.negative_fraction:.0%}",
+        flush=True,
+    )
+    scalars = {
+        "grad/cosine": diagnostics.cosine,
+        "grad/norm_ratio": diagnostics.norm_ratio,
+        "grad/full_norm": diagnostics.full_norm,
+        "grad/shallow_norm": diagnostics.shallow_norm,
+        "grad/negative_fraction": diagnostics.negative_fraction,
+    }
+    if tracker is not None:
+        tracker.log(scalars, step=step)
+    if artifacts is not None:
+        path = artifacts.raw_records_dir / "gradient_diagnostics.jsonl"
+        with path.open("a") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "global_step_index": step,
+                        "completed_updates": completed,
+                        **scalars,
+                        "layer_cosine": diagnostics.layer_cosine,
+                        "layer_norm_ratio": diagnostics.layer_norm_ratio,
+                    }
+                )
+                + "\n"
+            )
 
 
 def _report_sweep(
