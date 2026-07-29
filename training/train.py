@@ -163,23 +163,32 @@ def evaluate(
 
     Returns:
         A tuple ``(mean_loss, mean_exit_losses)`` where the second element maps
-        each exit's layer index to its own cross-entropy.
+        each exit's layer index to its own cross-entropy. Every exit appears,
+        not the rotating subset training scores.
     """
     model.eval()
     total = 0.0
     per_exit: dict[int, list[float]] = {}
     batches = 0
 
-    for inputs, targets in loader:
-        if batches >= config.eval_steps:
-            break
-        inputs, targets = inputs.to(device), targets.to(device)
-        with autocast:
-            out = model(inputs, targets=targets)
-        total += float(out.loss)
-        for layer, value in out.exit_losses.items():
-            per_exit.setdefault(layer, []).append(value)
-        batches += 1
+    # Every exit, not the step's rotation. The rotation is deterministic in the
+    # global step, so it aliases against any schedule keyed on the step: at
+    # eval_every=500 with five non-final exits and a budget of two, every
+    # evaluation landed on the same rotation position and scored the same two
+    # exits for the whole run. There is no memory reason to sample here -- this
+    # function is under no_grad, so no log-softmax is retained for a backward
+    # pass that never happens.
+    with model.score_all_exits():
+        for inputs, targets in loader:
+            if batches >= config.eval_steps:
+                break
+            inputs, targets = inputs.to(device), targets.to(device)
+            with autocast:
+                out = model(inputs, targets=targets)
+            total += float(out.loss)
+            for layer, value in out.exit_losses.items():
+                per_exit.setdefault(layer, []).append(value)
+            batches += 1
 
     model.train()
     if batches == 0:

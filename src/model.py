@@ -28,6 +28,7 @@ nowhere else.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -575,6 +576,9 @@ class Transformer(nn.Module):
         self.register_buffer(
             "_step_counter", torch.zeros((), dtype=torch.long), persistent=False
         )
+        # Set by :meth:`score_all_exits` to suspend that rotation. Not a buffer:
+        # it is scoped to a context manager and must never reach a checkpoint.
+        self._score_every_exit = False
         # Plain integers rather than buffers: these are instrumentation, they
         # must not enter a checkpoint, and they are read from tests and cost
         # accounting on the host anyway.
@@ -1227,6 +1231,14 @@ class Transformer(nn.Module):
         share a random seed, and consecutive steps cover the whole stack
         instead of leaving some exit starved by chance.
 
+        Being deterministic in the step, the rotation also aliases against any
+        other schedule keyed on the step. With five non-final exits and a budget
+        of two, the choice depends only on ``step % 5``, so an evaluation every
+        500 steps lands on the same position every time and scores the same two
+        exits for an entire run -- which is exactly what happened, leaving
+        depths 6, 8 and 10 with no held-out number after 38,140 steps. Callers
+        that are not a training step should hold :meth:`score_all_exits`.
+
         Args:
             n_exits: Total number of exits, including the final one.
 
@@ -1235,7 +1247,7 @@ class Transformer(nn.Module):
             always present, since it anchors both the loss and the
             distillation teacher.
         """
-        budget = self.config.exits_per_step
+        budget = None if self._score_every_exit else self.config.exits_per_step
         last = n_exits - 1
         if budget is None or budget >= last:
             return list(range(n_exits))
@@ -1244,6 +1256,34 @@ class Transformer(nn.Module):
         chosen = {(step * budget + offset) % last for offset in range(budget)}
         chosen.add(last)
         return sorted(chosen)
+
+    @contextmanager
+    def score_all_exits(self):
+        """Scores every exit for the duration of the block.
+
+        ``exits_per_step`` exists to bound memory during training: logits are
+        ``batch x seq_len x vocab`` per scored exit, and ``cross_entropy``
+        retains its log-softmax for the backward pass, so they cannot be freed
+        as the loop advances. Under :func:`torch.no_grad` nothing is retained
+        and that reason is gone, leaving only the rotation's aliasing against
+        the evaluation schedule -- a cost with no remaining benefit.
+
+        Evaluation is therefore the intended caller. It costs the extra forward
+        work of the unscored exits, which is real at this width: one vocabulary
+        projection is about 5.5 blocks at ``d_model=768``. It buys a held-out
+        number for every tier instead of for whichever ones the rotation
+        happened to align with.
+
+        Yields:
+            Nothing. The previous setting is restored on exit, including when
+            the block raises.
+        """
+        previous = self._score_every_exit
+        self._score_every_exit = True
+        try:
+            yield
+        finally:
+            self._score_every_exit = previous
 
     def forward(
         self,
