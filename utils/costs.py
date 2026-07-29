@@ -237,6 +237,130 @@ class AnalyticalCostModel:
         return float(feature_dim * hidden_dim + hidden_dim * n_tiers)
 
 
+@dataclass(frozen=True)
+class KVAudit:
+    """A cache measured against what the depth cap promised.
+
+    The request-level memory claim is a proof, not an estimate: with no entries
+    materialized above the cap, cache memory is ``2 b T d rho d_model`` and the
+    saving is exactly ``1 - d/L``. What a proof cannot establish is that the
+    implementation obeys it. Allocating upper layers and never writing to them,
+    or writing a zero-filled placeholder, leaves the arithmetic looking correct
+    while the memory saving is zero -- and the failure is invisible in every
+    quality metric, because quality is unaffected by memory that is merely
+    wasted.
+
+    This is the check the derivation asks for by name. It compares three
+    numbers that should agree exactly and are produced by entirely separate
+    code paths: what the cache actually holds, what the analytical model says a
+    depth-capped cache holds, and what the proportional law predicts.
+
+    Attributes:
+        depth: Executed blocks the cache was capped to.
+        n_layers: Full depth, for the proportional law.
+        seq_len: Positions cached.
+        measured_bytes: What the cache holds, read from the cache itself.
+        predicted_bytes: What :meth:`AnalyticalCostModel.kv_bytes` expects.
+        full_depth_bytes: What an uncapped cache of the same length would hold.
+        populated_layers: Indices of layers holding any entries.
+    """
+
+    depth: int
+    n_layers: int
+    seq_len: int
+    measured_bytes: int
+    predicted_bytes: int
+    full_depth_bytes: int
+    populated_layers: tuple[int, ...]
+
+    @property
+    def leaked_layers(self) -> tuple[int, ...]:
+        """Populated layers at or above the cap, which should be none.
+
+        A non-empty result is the failure the memory claim is exposed to: the
+        request executed to its depth but the cache materialized above it, so
+        the reported saving is not real.
+        """
+        return tuple(l for l in self.populated_layers if l >= self.depth)
+
+    @property
+    def measured_saving(self) -> float:
+        """Fraction of full-depth cache memory not materialized."""
+        return 1.0 - self.measured_bytes / max(self.full_depth_bytes, 1)
+
+    @property
+    def predicted_saving(self) -> float:
+        """The proportional law, ``1 - d/L``."""
+        return 1.0 - self.depth / max(self.n_layers, 1)
+
+    @property
+    def exact(self) -> bool:
+        """Whether measurement, analytical model and law all agree.
+
+        Byte counts are integers computed from the same integer quantities, so
+        exact equality is the right test; a tolerance here would hide precisely
+        the off-by-one-layer error worth catching.
+        """
+        return (
+            not self.leaked_layers
+            and self.measured_bytes == self.predicted_bytes
+            and abs(self.measured_saving - self.predicted_saving) < 1e-12
+        )
+
+    def report(self) -> str:
+        """Renders the audit as a line for a log.
+
+        Returns:
+            A single line, prefixed ``ok`` or ``LEAK``.
+        """
+        status = "ok  " if self.exact else "LEAK"
+        line = (
+            f"{status} depth {self.depth:>3}/{self.n_layers}  "
+            f"T={self.seq_len:<6} measured {self.measured_bytes:>12,}B  "
+            f"predicted {self.predicted_bytes:>12,}B  "
+            f"saving {self.measured_saving:.4f} (law {self.predicted_saving:.4f})"
+        )
+        if self.leaked_layers:
+            line += f"  layers above the cap holding entries: {self.leaked_layers}"
+        elif self.measured_bytes != self.predicted_bytes:
+            line += "  measurement disagrees with the analytical model"
+        return line
+
+
+def audit_kv_cache(
+    cache,
+    cost_model: AnalyticalCostModel,
+    n_layers: int,
+    dtype: str = "fp32",
+) -> KVAudit:
+    """Measures a depth-capped cache against the proportional memory claim.
+
+    Args:
+        cache: A :class:`src.modules.KVCache`, or anything exposing
+            ``active_depth``, ``seq_len``, ``bytes_allocated`` and
+            ``layer_presence``.
+        cost_model: Model supplying the analytical prediction.
+        n_layers: Full depth of the network.
+        dtype: Cache precision, a key of :data:`DTYPE_BYTES`.
+
+    Returns:
+        The audit. Read :attr:`KVAudit.exact` for the verdict.
+    """
+    depth = cache.active_depth
+    seq_len = cache.seq_len
+    return KVAudit(
+        depth=depth,
+        n_layers=n_layers,
+        seq_len=seq_len,
+        measured_bytes=cache.bytes_allocated,
+        predicted_bytes=cost_model.kv_bytes(depth, seq_len, dtype),
+        full_depth_bytes=cost_model.kv_bytes(n_layers, seq_len, dtype),
+        populated_layers=tuple(
+            index for index, present in enumerate(cache.layer_presence) if present
+        ),
+    )
+
+
 @dataclass
 class CostCounters:
     """What an execution actually did, counted as it happened.

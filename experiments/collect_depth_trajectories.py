@@ -322,7 +322,13 @@ def tier_costs(
         # point of reading out only at the endpoint.
         total += max(generated, 1) * cost.head_macs
         macs.append(total)
-        kv.append(cost.kv_bytes(depth, prompt_len + generated, cache_dtype))
+        # One position short of prompt + generated: the last token emitted is
+        # never fed back, so nothing ever attends to it and its keys and values
+        # are not written. Confirmed against a real cache across four request
+        # shapes, where measured bytes are exactly
+        # ``(prompt_len + generated - 1) * depth * kv_width * 2 * b``.
+        cached = max(prompt_len + generated - 1, prompt_len)
+        kv.append(cost.kv_bytes(depth, cached, cache_dtype))
 
     return {
         "macs": np.array(macs, dtype=float),

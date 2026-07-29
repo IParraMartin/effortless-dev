@@ -388,7 +388,84 @@ def run(config: BenchmarkConfig) -> dict:
         "head_to_block_ratio": cost_model.head_to_block_ratio,
         "measurements": [asdict(m) for m in measurements],
         "realization": realization_table(measurements, model.config.n_layers),
+        "kv_memory": kv_memory_table(
+            measurements, model.config.n_layers, cost_model, cache_dtype_name(model)
+        ),
     }
+
+
+def cache_dtype_name(model) -> str:
+    """Names the precision a model's cache entries are stored at.
+
+    The cache holds whatever the model runs in; nothing configures it
+    separately. Read from the parameters rather than assumed, because
+    predicting bytes at the wrong precision would report a clean factor-of-two
+    disagreement and look like a leak.
+
+    Args:
+        model: Any module with parameters.
+
+    Returns:
+        A key of :data:`utils.costs.DTYPE_BYTES`.
+    """
+    names = {
+        torch.float32: "fp32",
+        torch.bfloat16: "bf16",
+        torch.float16: "fp16",
+    }
+    return names.get(next(model.parameters()).dtype, "fp32")
+
+
+def kv_memory_table(
+    measurements: list[Measurement],
+    full_depth: int,
+    cost_model: AnalyticalCostModel,
+    dtype: str,
+) -> list[dict]:
+    """Checks measured cache bytes against the proportional memory claim.
+
+    The request-level memory result is a proof: with nothing materialized above
+    the cap, cache memory is exactly proportional to depth. What a proof cannot
+    establish is that the code obeys it, and the failure mode is silent --
+    allocating upper layers costs no quality, only the saving being claimed. So
+    the measured bytes are compared here against an analytical prediction
+    computed from an entirely separate path.
+
+    Args:
+        measurements: Every benchmarked configuration.
+        full_depth: Layers in the network.
+        cost_model: Supplies the analytical prediction.
+        dtype: Cache precision the benchmark ran at.
+
+    Returns:
+        One row per configuration, with measured and predicted bytes, the
+        realized saving, the law's saving, and whether they agree.
+    """
+    rows = []
+    for m in sorted(
+        measurements, key=lambda m: (m.batch_size, m.prompt_len, m.new_tokens, m.depth)
+    ):
+        # The last generated token is emitted but never fed back, so nothing
+        # attends to it and its keys and values are never written. Getting this
+        # wrong is not cosmetic: it makes every row disagree by one position in
+        # T and reads exactly like a leak.
+        positions = max(m.prompt_len + m.new_tokens - 1, m.prompt_len)
+        predicted = cost_model.kv_bytes(m.depth, positions, dtype) * m.batch_size
+        full = cost_model.kv_bytes(full_depth, positions, dtype) * m.batch_size
+        rows.append(
+            {
+                "depth": m.depth,
+                "batch_size": m.batch_size,
+                "prompt_len": m.prompt_len,
+                "new_tokens": m.new_tokens,
+                "kv_bytes_measured": m.kv_bytes,
+                "kv_bytes_predicted": predicted,
+                "saving_measured": 1.0 - m.kv_bytes / max(full, 1),
+                "saving_law": 1.0 - m.depth / max(full_depth, 1),
+                "agrees": m.kv_bytes == predicted,
+            }
+        )
+    return rows
 
 
 def realization_table(
@@ -468,6 +545,43 @@ def format_markdown(results: dict) -> str:
             f"{m['total_p50']:.2f} | {m['tokens_per_second']:.1f} | "
             f"{m['kv_bytes']:,} |"
         )
+
+    rows = results.get("kv_memory") or []
+    if rows:
+        leaks = [r for r in rows if not r["agrees"]]
+        lines += [
+            "",
+            "## K/V memory: does the depth cap reach the allocator?",
+            "",
+            "Cache memory under a depth cap is a proof, not an estimate — with "
+            "nothing materialized above the cap it falls exactly `1 - d/L`. "
+            "What a proof cannot establish is that the code obeys it, and the "
+            "failure is silent: allocating upper layers costs no quality, only "
+            "the saving being claimed. `measured` is read from the cache, "
+            "`predicted` from the analytical model, and the two reach this "
+            "table by separate paths.",
+            "",
+            "| depth | batch | prompt | tokens | measured | predicted | "
+            "saving | law | agrees |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|:--:|",
+        ]
+        for r in rows:
+            lines.append(
+                f"| {r['depth']} | {r['batch_size']} | {r['prompt_len']} | "
+                f"{r['new_tokens']} | {r['kv_bytes_measured']:,} | "
+                f"{r['kv_bytes_predicted']:,} | {r['saving_measured']:.4f} | "
+                f"{r['saving_law']:.4f} | {'yes' if r['agrees'] else '**NO**'} |"
+            )
+        lines += [
+            "",
+            f"**{len(rows) - len(leaks)}/{len(rows)} configurations agree.**"
+            if not leaks
+            else f"**{len(leaks)} of {len(rows)} configurations disagree.** The "
+                 "measured cache does not match a depth-capped allocation, so "
+                 "the K/V memory saving reported anywhere in this run is not "
+                 "supported.",
+            "",
+        ]
 
     lines += [
         "",
