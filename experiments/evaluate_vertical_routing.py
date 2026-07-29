@@ -568,13 +568,78 @@ def load_manifest(path: str | Path) -> list[dict]:
             f"Manifest mixes tokenizers {sorted(tokenizers)}. Quality is not "
             f"comparable across tokenizations, and neither is per-token cost."
         )
+
+    units = {entry.get("quality_unit", "unstated") for entry in entries}
+    if len(units) > 1:
+        raise ValueError(
+            f"Manifest mixes quality units {sorted(units)}. Two models measured "
+            f"in different units cannot form a frontier."
+        )
+
+    scalar_only = [
+        entry["model_id"] for entry in entries if not entry.get("cost_profile")
+    ]
+    if scalar_only:
+        print(
+            f"  warning: {len(scalar_only)} manifest entry/entries carry only a "
+            f"scalar cost ({', '.join(scalar_only[:3])}). Cost depends on request "
+            f"shape, so a matched-cost comparison built on a scalar is matched "
+            f"only on average and can invert on individual shapes.",
+            flush=True,
+        )
+
     return sorted(entries, key=lambda entry: entry["tier"])
+
+
+def check_units_comparable(manifest: list[dict], quality_metric: str) -> str:
+    """Refuses a cross-family comparison stated in an incomparable unit.
+
+    This is the guard the horizontal comparison most needs. The backbone here was
+    trained with GPT-2's tokenizer and Pythia uses GPT-NeoX's, so the same text
+    becomes different token sequences and per-token loss is not comparable between
+    them: a tokenizer that splits more finely earns a lower average loss per piece
+    without predicting anything better. Only a unit with the tokenizer removed
+    from the denominator — bits per byte — can be compared.
+
+    Args:
+        manifest: Loaded manifest entries.
+        quality_metric: The vertical side's quality column.
+
+    Returns:
+        The manifest's quality unit.
+
+    Raises:
+        ValueError: If the manifest is measured in a tokenizer-independent unit
+            while the vertical side is not, or vice versa.
+    """
+    unit = next(
+        (entry.get("quality_unit") for entry in manifest if entry.get("quality_unit")),
+        None,
+    )
+    if unit is None:
+        raise ValueError(
+            "the manifest does not state its quality unit, so it cannot be shown "
+            "comparable with the vertical side's "
+            f"{quality_metric!r}. Rebuild it with experiments.horizontal_family."
+        )
+    if unit != quality_metric:
+        raise ValueError(
+            f"the manifest measures quality in {unit!r} but the vertical side is "
+            f"being evaluated on {quality_metric!r}. These are different "
+            f"quantities and differencing them is meaningless. If the two sides "
+            f"use different tokenizers, only a tokenizer-independent unit is "
+            f"valid: collect the vertical trajectories on a decodable corpus and "
+            f"pass --quality_metric=bits_per_byte."
+        )
+    return unit
 
 
 def horizontal_systems(
     manifest: list[dict],
     n_requests: int,
     lambdas: tuple[float, ...],
+    shapes: list[str] | None = None,
+    request_hashes: list[str] | None = None,
 ) -> tuple[list[SystemResult], np.ndarray, np.ndarray]:
     """Evaluates independently trained models and their oracle.
 
@@ -593,14 +658,30 @@ def horizontal_systems(
     quality_columns, cost_columns = [], []
     for entry in manifest:
         values = np.asarray(json.loads(Path(entry["results"]).read_text()), float)
-        if values.shape[0] != n_requests:
+        # Align by content, not by position. The vertical side reports on a
+        # frozen subset -- the controller's untouched report split -- while the
+        # family is scored on every drawn request, so the two arrays are
+        # different lengths by design. Matching on length would have forced the
+        # family to be rescored per split; matching on order would silently pair
+        # unrelated requests.
+        if request_hashes is not None and entry.get("request_hashes"):
+            values = _align_by_hash(entry, values, request_hashes)
+        elif values.shape[0] != n_requests:
             raise ValueError(
                 f"Model {entry['model_id']} reports {values.shape[0]} requests "
                 f"but the vertical side has {n_requests}. Paired comparison "
-                f"requires the same requests in the same order."
+                f"requires the same requests, and this manifest carries no "
+                f"request_hashes to align them by. Rebuild it with "
+                f"experiments.horizontal_family, which records a content digest "
+                f"per request."
             )
+        # Oriented so larger is always better, matching quality_matrix. Bits per
+        # byte is lower-is-better, and a sign error here would invert every
+        # policy that reads it.
+        if entry.get("quality_direction") == "lower_is_better":
+            values = -values
         quality_columns.append(values)
-        cost_columns.append(np.full(n_requests, float(entry["cost"])))
+        cost_columns.append(_per_request_cost(entry, n_requests, shapes))
 
     quality = np.stack(quality_columns, axis=1)
     cost = np.stack(cost_columns, axis=1)
@@ -620,6 +701,78 @@ def horizontal_systems(
         oracle_system(quality, cost, lam, family="horizontal") for lam in lambdas
     ]
     return systems, quality, cost
+
+
+def _align_by_hash(
+    entry: dict, values: np.ndarray, wanted: list[str]
+) -> np.ndarray:
+    """Selects a model's results for the requests the vertical side reports on.
+
+    Args:
+        entry: Manifest entry, carrying a ``request_hashes`` file.
+        values: The model's per-request quality, in its own scoring order.
+        wanted: Content digests of the report rows, in report order.
+
+    Returns:
+        The model's quality for exactly those requests, in that order.
+
+    Raises:
+        ValueError: If a requested digest is absent, or if the model's hash file
+            does not line up with its own results.
+    """
+    hashes = json.loads(Path(entry["request_hashes"]).read_text())
+    if len(hashes) != values.shape[0]:
+        raise ValueError(
+            f"Model {entry['model_id']} reports {values.shape[0]} qualities but "
+            f"{len(hashes)} request hashes; the two files disagree."
+        )
+
+    position = {digest: index for index, digest in enumerate(hashes)}
+    missing = [digest for digest in wanted if digest not in position]
+    if missing:
+        raise ValueError(
+            f"Model {entry['model_id']} did not score {len(missing)} of the "
+            f"{len(wanted)} requests the vertical side reports on. Both sides "
+            f"must see identical content: use the same --data, --eos_id, "
+            f"--shapes, --n_requests and --seed."
+        )
+    return values[[position[digest] for digest in wanted]]
+
+
+def _per_request_cost(
+    entry: dict, n_requests: int, shapes: list[str] | None
+) -> np.ndarray:
+    """Expands a manifest entry's cost to one value per request.
+
+    Args:
+        entry: Manifest entry.
+        n_requests: Requests being evaluated.
+        shapes: Request shape label per request, or ``None`` if unknown.
+
+    Returns:
+        Per-request cost. A shape-aware profile is used when both it and the
+        per-request shapes are available; otherwise the scalar is broadcast, which
+        matches cost only on average.
+
+    Raises:
+        ValueError: If a request's shape is absent from the profile, since
+            silently falling back to the scalar for some requests and not others
+            would produce a cost column nobody could interpret.
+    """
+    profile = entry.get("cost_profile")
+    if not profile or shapes is None:
+        return np.full(n_requests, float(entry["cost"]))
+
+    missing = sorted(set(shapes) - set(profile))
+    if missing:
+        raise ValueError(
+            f"Model {entry['model_id']} has no cost profile for request "
+            f"shape(s) {missing}. Score it on the same shapes as the vertical "
+            f"side, or the comparison is matched on cost for only some requests."
+        )
+    return np.asarray(
+        [float(profile[shape]["analytical_macs"]) for shape in shapes], dtype=float
+    )
 
 
 def cascade_system(
@@ -999,9 +1152,18 @@ def evaluate(config: EvaluationConfig) -> dict:
     horizontal_tiers: list[int] | None = None
     if config.manifest:
         manifest = load_manifest(config.manifest)
+        check_units_comparable(manifest, config.quality_metric)
         horizontal_tiers = [int(entry["tier"]) for entry in manifest]
         extra, horizontal_quality, horizontal_cost = horizontal_systems(
-            manifest, len(subset), config.lambdas
+            manifest,
+            len(subset),
+            config.lambdas,
+            shapes=[record.get("shape", "") for record in subset],
+            request_hashes=(
+                [record["text_sha256"] for record in subset]
+                if all(record.get("text_sha256") for record in subset)
+                else None
+            ),
         )
         systems += extra
 

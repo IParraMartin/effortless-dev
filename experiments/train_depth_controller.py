@@ -53,6 +53,8 @@ QUALITY_METRICS = {
     "teacher_forced_accuracy": True,
     "teacher_forced_top1_agreement": True,
     "teacher_forced_nll": False,
+    # The only column comparable against a model from another tokenizer family.
+    "bits_per_byte": False,
     "free_running_reward": True,
     "free_running_agreement": True,
 }

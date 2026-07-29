@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -70,7 +71,12 @@ from utils.provenance import RunRecord, file_digest
 #: and the corpus the requests came from. The sums are what make a corpus-level
 #: number correct: requests differ in length, so a mean of per-request means is
 #: not the corpus NLL, and the difference grows with the spread of lengths.
-SCHEMA_VERSION = 2
+#:
+#: Version 3 adds ``continuation_bytes``, ``text_sha256`` and per-tier
+#: ``bits_per_byte``. Per-token loss cannot be compared against a model that uses
+#: a different tokenizer, so a cross-family comparison needs a unit with the
+#: tokenizer removed from the denominator.
+SCHEMA_VERSION = 3
 
 #: Corpora the collector can draw from.
 #:
@@ -258,6 +264,15 @@ class RequestRecord:
             content rather than an offset that a re-tokenization would move.
         corpus_offset: Where the request began in the token file.
         shape: Request shape label, e.g. ``"p128c64"``.
+        continuation_bytes: UTF-8 byte length of the continuation text. Zero when
+            the corpus could not be decoded, in which case ``bits_per_byte`` is
+            empty and no cross-tokenizer comparison is possible.
+        text_sha256: Digest of the continuation text, so two models with different
+            tokenizers can prove they scored the same content.
+        bits_per_byte: Quality per tier in a tokenizer-independent unit,
+            ``nll_sum / (ln(2) * continuation_bytes)``. Lower is better. This is
+            the only quality column that may be compared against an independently
+            trained model from a different tokenizer family.
     """
 
     request_id: int
@@ -282,6 +297,11 @@ class RequestRecord:
     token_hash: str = ""
     corpus_offset: int = -1
     shape: str = ""
+    # Schema 3. Tokenizer-independent quality, for comparison against models
+    # from another tokenizer family.
+    continuation_bytes: int = 0
+    text_sha256: str = ""
+    bits_per_byte: list[float] = field(default_factory=list)
     free_running_reward: list[float] = field(default_factory=list)
     free_running_agreement: list[float] = field(default_factory=list)
     final_nll: float = 0.0
@@ -695,6 +715,25 @@ def collect(config: TrajectoryConfig) -> tuple[list[RequestRecord], np.ndarray, 
                         subset.offsets[row] if subset.offsets is not None else -1
                     ),
                     shape=f"p{subset.prompt_len}c{subset.continuation_len}",
+                    continuation_bytes=(
+                        subset.continuation_bytes[row]
+                        if subset.continuation_bytes is not None
+                        else 0
+                    ),
+                    text_sha256=(
+                        subset.text_hashes[row]
+                        if subset.text_hashes is not None
+                        else ""
+                    ),
+                    bits_per_byte=(
+                        (
+                            teacher["nll_sum"][row]
+                            / (math.log(2.0) * subset.continuation_bytes[row])
+                        ).tolist()
+                        if subset.continuation_bytes is not None
+                        and subset.continuation_bytes[row] > 0
+                        else []
+                    ),
                 )
             )
 

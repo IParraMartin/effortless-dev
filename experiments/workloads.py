@@ -128,6 +128,17 @@ class Workload:
     #: Free-form label carried through to the record, for source-level shift
     #: analysis. Uniform when the corpus has no domain metadata.
     domains: list[str] | None = None
+    #: UTF-8 byte length of each request's *continuation* text. This is what
+    #: makes quality comparable across tokenizers: per-token NLL is not, since a
+    #: tokenizer that splits text more finely earns a lower per-token loss on the
+    #: same string. ``None`` when no tokenizer was supplied to decode with.
+    continuation_bytes: list[int] | None = None
+    #: The decoded prompt and continuation text of each request, so a model with
+    #: a different tokenizer can re-encode the identical string.
+    texts: list[tuple[str, str]] | None = None
+    #: Digest of the continuation text, so two models can prove they scored the
+    #: same content rather than the same offsets.
+    text_hashes: list[str] | None = None
 
     def __len__(self) -> int:
         """Number of requests."""
@@ -171,6 +182,9 @@ class Workload:
             token_hashes=subset(self.token_hashes),
             offsets=subset(self.offsets),
             domains=subset(self.domains),
+            continuation_bytes=subset(self.continuation_bytes),
+            texts=subset(self.texts),
+            text_hashes=subset(self.text_hashes),
         )
 
 
@@ -359,6 +373,7 @@ def real_text_corpus(
     eos_id: int | None = None,
     seed: int = 0,
     split: str = "validation",
+    tokenizer_name: str | None = None,
 ) -> tuple[list[Workload], dict]:
     """Draws requests from a tokenized corpus written by ``training.data``.
 
@@ -398,6 +413,13 @@ def real_text_corpus(
             returned metadata records that this happened.
         seed: Seed for offset selection.
         split: Split label recorded on every request.
+        tokenizer_name: Tokenizer to decode requests back to text with. Supplying
+            it records each continuation's UTF-8 byte length and text digest,
+            which is what a cross-tokenizer comparison needs: per-token NLL is
+            not comparable between tokenizers, and bits per byte is. Defaults to
+            the tokenizer recorded in the corpus sidecar. Pass ``""`` to skip
+            decoding, at the cost of being unable to compare against a model from
+            another tokenizer family.
 
     Returns:
         A tuple ``(workloads, metadata)`` with one workload per shape that got at
@@ -437,6 +459,19 @@ def real_text_corpus(
             f"wrong for this tokenizer, which would split on the wrong token."
         )
 
+    resolved_tokenizer = (
+        meta.get("tokenizer_name") if tokenizer_name is None else tokenizer_name
+    )
+    decoder = None
+    decode_error = None
+    if resolved_tokenizer:
+        try:
+            from src.tokenizer import load_tokenizer
+
+            decoder = load_tokenizer(resolved_tokenizer)
+        except Exception as error:  # noqa: BLE001 - reported, never fatal
+            decode_error = f"{type(error).__name__}: {error}"
+
     rng = np.random.default_rng(seed)
     per_shape: dict[RequestShape, list[dict]] = {shape: [] for shape in shapes}
 
@@ -469,6 +504,11 @@ def real_text_corpus(
         if not drawn:
             continue
         stacked = torch.from_numpy(np.stack([item["tokens"] for item in drawn]))
+        texts = byte_lengths = text_hashes = None
+        if decoder is not None:
+            texts, byte_lengths, text_hashes = _decode_requests(
+                decoder, stacked, shape.prompt_len
+            )
         workloads.append(
             Workload(
                 prompts=stacked[:, : shape.prompt_len],
@@ -479,6 +519,9 @@ def real_text_corpus(
                 token_hashes=[item["hash"] for item in drawn],
                 offsets=[item["offset"] for item in drawn],
                 domains=[meta.get("dataset_name", "unknown")] * len(drawn),
+                continuation_bytes=byte_lengths,
+                texts=texts,
+                text_hashes=text_hashes,
                 spec={
                     "corpus": "real_text",
                     "shape": shape.label(),
@@ -506,7 +549,21 @@ def real_text_corpus(
         "requests_drawn": drawn_total,
         "shapes": [shape.label() for shape in shapes],
         "seed": seed,
+        "decoded_with": resolved_tokenizer if decoder is not None else None,
+        "quality_unit": "bits_per_byte" if decoder is not None else "per_token",
     }
+    if decode_error is not None:
+        metadata["decode_note"] = (
+            f"could not load tokenizer {resolved_tokenizer!r} ({decode_error}), so "
+            f"continuation byte lengths are unavailable. Quality can only be "
+            f"reported per token, which is not comparable against a model that "
+            f"uses a different tokenizer."
+        )
+    elif decoder is None:
+        metadata["decode_note"] = (
+            "decoding was skipped, so quality can only be reported per token, "
+            "which is not comparable across tokenizers."
+        )
     if eos_id is None:
         metadata["clustering_note"] = (
             "eos_id was not supplied, so document boundaries are unknown and the "
@@ -733,3 +790,49 @@ if __name__ == "__main__":
 
     print("\nendpoint accuracy on the continuation:")
     print(format_accuracy_table(exit_accuracy_by_difficulty(model, workload)))
+
+
+def _decode_requests(
+    tokenizer,
+    sequences: torch.Tensor,
+    prompt_len: int,
+) -> tuple[list[tuple[str, str]], list[int], list[str]]:
+    """Decodes requests back to text and measures the continuations in bytes.
+
+    Per-token loss is not comparable across tokenizers. A tokenizer that splits
+    the same string into more pieces earns a lower average loss per piece without
+    predicting anything better, so comparing a GPT-2-tokenized model against a
+    GPT-NeoX-tokenized one on per-token NLL rewards whichever tokenizer is
+    finer-grained. Bits per byte removes the tokenizer from the denominator:
+
+    .. code-block:: text
+
+        bits_per_byte = nll_sum_nats / (ln(2) * utf8_bytes(continuation))
+
+    Args:
+        tokenizer: Tokenizer that produced the ids.
+        sequences: Token ids shaped ``(n_requests, prompt_len + continuation)``.
+        prompt_len: Where the continuation starts.
+
+    Returns:
+        A tuple ``(texts, byte_lengths, hashes)``. ``texts`` holds
+        ``(prompt, continuation)`` string pairs so a model from another family
+        can re-encode the identical string; ``byte_lengths`` is the UTF-8 length
+        of each continuation; ``hashes`` digests each continuation so two models
+        can prove they scored the same content.
+    """
+    import hashlib
+
+    texts: list[tuple[str, str]] = []
+    byte_lengths: list[int] = []
+    hashes: list[str] = []
+
+    for row in sequences.tolist():
+        prompt = tokenizer.decode(row[:prompt_len])
+        continuation = tokenizer.decode(row[prompt_len:])
+        encoded = continuation.encode("utf-8")
+        texts.append((prompt, continuation))
+        byte_lengths.append(len(encoded))
+        hashes.append(hashlib.sha256(encoded).hexdigest()[:32])
+
+    return texts, byte_lengths, hashes
