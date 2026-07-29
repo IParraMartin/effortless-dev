@@ -728,6 +728,7 @@ class Transformer(nn.Module):
                     self.config.d_model,
                     self.config.vocab_size,
                     self.config.norm_eps,
+                    adapter_rank=self.config.exit_adapter_rank,
                 )
                 for _ in self.config.exit_layers
             )
@@ -781,12 +782,17 @@ class Transformer(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(exit_seed + 1_000_003 + layer)
                 exit_module.apply(self._init_weights)
-        # ``Module.apply`` also visits propagation adapters and would overwrite
-        # their deliberate zero initialization. Restore exact identity after the
-        # model-wide initialization pass.
+        # ``Module.apply`` also visits the zero-initialized adapters and would
+        # overwrite their deliberate identity. Restore it after every
+        # initialization pass, not inside the constructors: the constructors are
+        # correct and the traversal above undoes them, which is a failure that
+        # only exists once the whole model has been built.
         for block in self.blocks:
             if block.kv_adapter is not None:
                 block.kv_adapter.reset_identity()
+        for exit_module in self.exit_modules:
+            if exit_module.adapter is not None:
+                exit_module.adapter.reset_identity()
 
         if self.config.tie_embeddings:
             # Every exit shares one output matrix, itself tied to the input

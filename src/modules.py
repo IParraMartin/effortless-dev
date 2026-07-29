@@ -402,6 +402,67 @@ class RotaryEmbedding(nn.Module):
         return self.rotate(q, offset), self.rotate(k, offset)
 
 
+class ExitAdapter(nn.Module):
+    """A zero-initialized residual bottleneck placed before an exit's readout.
+
+    A frozen parent gives shallow exits whatever happens to be linearly
+    decodable from its intermediate states. That is a real lower bound, but it is
+    a weak one, and unfreezing the backbone to improve it costs the parent's
+    output. An adapter buys nonlinear remapping of the intermediate state without
+    touching a single backbone weight, which keeps the no-regret property exact
+    rather than approximate.
+
+    The up-projection is zero, so at initialization the module returns its input
+    unchanged. That matters for two reasons: adding adapters to a checkpoint
+    cannot perturb it, and a training curve that starts from the frozen-exit
+    result is directly comparable to it.
+
+    Args:
+        d_model: Width of the residual stream.
+        rank: Bottleneck width. Cost is two ``d_model x rank`` matrices, which
+            is negligible beside a vocabulary-sized head.
+
+    Attributes:
+        down: Projection into the bottleneck.
+        up: Projection back out, zero-initialized.
+
+    Raises:
+        ValueError: If ``rank`` is not positive.
+    """
+
+    def __init__(self, d_model: int, rank: int) -> None:
+        super().__init__()
+        if rank < 1:
+            raise ValueError(f"rank must be positive, got {rank}.")
+        self.down = nn.Linear(d_model, rank, bias=False)
+        self.up = nn.Linear(rank, d_model, bias=False)
+        self.reset_identity()
+
+    def reset_identity(self) -> None:
+        """Restores exact identity behaviour.
+
+        Called again after the model-wide initialization traversal, which visits
+        every submodule and would otherwise fill ``up`` with the standard normal
+        initialization — turning a documented identity into a random perturbation
+        of the parent. That failure is invisible in the constructor and only
+        appears once the whole model has been built, which is where the
+        regression test for it lives.
+        """
+        nn.init.normal_(self.down.weight, std=0.02)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies the residual correction.
+
+        Args:
+            x: Hidden state shaped ``(..., d_model)``.
+
+        Returns:
+            ``x + up(silu(down(x)))``, shaped like ``x``.
+        """
+        return x + self.up(F.silu(self.down(x)))
+
+
 class ExitModule(nn.Module):
     """Turns a layer's hidden state into next-token logits.
 
@@ -420,15 +481,25 @@ class ExitModule(nn.Module):
         d_model: Width of the residual stream.
         vocab_size: Number of output logits.
         eps: Epsilon for the normalization.
+        adapter_rank: Width of an optional :class:`ExitAdapter` placed before the
+            normalization. ``0`` omits it, which is the historical behaviour.
 
     Attributes:
+        adapter: Optional zero-initialized residual bottleneck, or ``None``.
         norm: Per-layer :class:`RMSNorm`.
         proj: Output projection whose weight is shared with every other exit
             and with the input embedding.
     """
 
-    def __init__(self, d_model: int, vocab_size: int, eps: float = 1e-5) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        vocab_size: int,
+        eps: float = 1e-5,
+        adapter_rank: int = 0,
+    ) -> None:
         super().__init__()
+        self.adapter = ExitAdapter(d_model, adapter_rank) if adapter_rank else None
         self.norm = RMSNorm(d_model, eps=eps)
         self.proj = nn.Linear(d_model, vocab_size, bias=False)
 
@@ -441,6 +512,8 @@ class ExitModule(nn.Module):
         Returns:
             Logits shaped ``(batch, seq_len, vocab_size)``.
         """
+        if self.adapter is not None:
+            x = self.adapter(x)
         return self.proj(self.norm(x))
 
 

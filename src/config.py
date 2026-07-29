@@ -115,6 +115,12 @@ class TransformerConfig:
         init_std: Standard deviation of the normal weight initialization.
         exit_every: Place an exit module every ``exit_every`` layers. The final
             layer always carries one, so ``1`` puts an exit on every layer.
+        exit_adapter_rank: Bottleneck width of a zero-initialized residual
+            adapter placed before each exit's readout. ``0`` omits it. Nonzero
+            lets a frozen backbone's intermediate states be remapped nonlinearly
+            without touching a backbone weight, which is what keeps the parent's
+            output exactly unchanged rather than approximately so. Include its
+            inference cost in every endpoint cost.
         min_exit_layer: Earliest layer index allowed to terminate a token. The
             first layer or two rarely carry a usable prediction, and letting
             them fire mostly produces noise.
@@ -236,6 +242,7 @@ class TransformerConfig:
     init_std: float = 0.02
 
     exit_every: int = 1
+    exit_adapter_rank: int = 0
     min_exit_layer: int = 1
     exit_threshold: float = 0.3
     exit_criterion: str = "entropy"
@@ -295,6 +302,11 @@ class TransformerConfig:
 
         if self.exit_every < 1:
             raise ValueError(f"exit_every must be positive, got {self.exit_every}.")
+        if self.exit_adapter_rank < 0:
+            raise ValueError(
+                "exit_adapter_rank must be non-negative, got "
+                f"{self.exit_adapter_rank}."
+            )
         if not 0 <= self.min_exit_layer < self.n_layers:
             raise ValueError(
                 f"min_exit_layer must lie in [0, n_layers), got "

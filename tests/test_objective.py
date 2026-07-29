@@ -133,7 +133,7 @@ class ZeroAlphaIsFinalOnly(unittest.TestCase):
         model = Transformer(config(shallow_loss_weight=0.0))
         out = model(self.ids, targets=self.targets)
 
-        self.assertAlmostEqual(float(out.loss), out.full_loss, places=6)
+        self.assertAlmostEqual(float(out.loss.detach()), out.full_loss, places=6)
 
     def test_the_gradient_equals_a_final_only_model_from_the_same_parent(self) -> None:
         """The point of P0-2: same seed, same backbone, so this is comparable.
