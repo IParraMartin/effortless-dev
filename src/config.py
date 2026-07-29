@@ -862,6 +862,16 @@ class TrainConfig:
         out_dir: Directory checkpoints are written to.
         save_every: Steps between checkpoints.
         resume_from: Checkpoint path to restore model, optimizer, and step from.
+        init_from: Serialized *initialization* to branch from, before any
+            training. Distinct from ``resume_from``: it carries weights only, at
+            step zero, so two arms that differ in objective still provably start
+            from the same parameters. Matching seeds is not the same guarantee —
+            any change to construction order moves the stream, and the two arms
+            of a causal comparison are exactly the runs whose construction
+            differs.
+        save_init_to: Write the initialization here before training starts, then
+            continue. Run once to mint the common parent that every arm of a
+            comparison branches from.
         eval_every: Steps between validation passes.
         eval_steps: Validation batches per pass.
         sweep_every: Steps between exit-threshold sweeps. ``0`` disables them.
@@ -917,6 +927,8 @@ class TrainConfig:
     out_dir: str = "checkpoints"
     save_every: int = 1000
     resume_from: str | None = None
+    init_from: str | None = None
+    save_init_to: str | None = None
     eval_every: int = 500
     eval_steps: int = 50
     sweep_every: int = 2000

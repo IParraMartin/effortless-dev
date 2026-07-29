@@ -19,6 +19,13 @@ So the tests here concentrate on the guards rather than the arithmetic:
 
 No test here downloads a model. The scoring path is exercised with a stub whose
 tokenizer and loss are chosen so the expected bits-per-byte is computable by hand.
+
+One property is deliberately *not* asserted: that batched and unbatched scoring
+agree. Measured against real Pythia in fp32 on CPU they do not, by up to 2.6% of
+a request's total NLL, because GEMM kernel selection changes the accumulation
+order with the batch dimension. The model is deterministic and the cause is
+outside this repository, so the manifest records ``batch_size`` and says that
+values from different batch sizes are not comparable.
 """
 
 from __future__ import annotations

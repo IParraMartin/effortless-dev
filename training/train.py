@@ -44,7 +44,7 @@ from utils.calibration import format_sweep, recommend_threshold, sweep_threshold
 from src.config import TrainConfig, TransformerConfig, parse_configs
 from training.data import build_dataloader
 from src.model import Transformer
-from utils.provenance import RunArtifacts
+from utils.provenance import RunArtifacts, file_digest
 from utils.tracking import RunTracker
 from src.tokenizer import config_from_tokenizer, load_tokenizer
 
@@ -417,6 +417,57 @@ def main(
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
 
+    # A common parent, serialized rather than reseeded. Two arms of a causal
+    # comparison differ in construction -- that is what makes them different arms
+    # -- so any change in how many random draws construction consumes moves the
+    # initialization even under an identical seed. That is the defect that made
+    # the first two Savio arms non-comparable. Branching from a file removes the
+    # argument entirely: the digest either matches or it does not.
+    parent_digest = None
+    if train_config.init_from is not None:
+        if checkpoint is not None:
+            raise ValueError(
+                "init_from and resume_from are mutually exclusive: one starts a "
+                "new arm from a common parent, the other continues an existing "
+                f"run. Got init_from={train_config.init_from!r} and "
+                f"resume_from={train_config.resume_from!r}."
+            )
+        blob = torch.load(
+            train_config.init_from, map_location="cpu", weights_only=False
+        )
+        incompatible = model.load_state_dict(blob["model"], strict=False)
+        if incompatible.missing_keys:
+            raise ValueError(
+                f"{train_config.init_from} is missing "
+                f"{len(incompatible.missing_keys)} parameter(s) this "
+                f"architecture needs, starting with "
+                f"{incompatible.missing_keys[:3]}. A common parent must cover "
+                f"every shared parameter or the arms do not share one."
+            )
+        parent_digest = file_digest(train_config.init_from)
+        if context.is_main:
+            print(f"parent: {train_config.init_from} ({parent_digest[:12]})")
+
+    if train_config.save_init_to is not None and context.is_main:
+        path = Path(train_config.save_init_to)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "model": raw_state_dict(model),
+                "model_config": model_config,
+                "step": 0,
+                "completed_updates": 0,
+                "seeds": asdict(seeds),
+                "purpose": (
+                    "common parent initialization; branch causal arms from this "
+                    "with --init_from so they provably share parameters"
+                ),
+            },
+            path,
+        )
+        print(f"parent: wrote {path} ({file_digest(path)[:12]})")
+
     tokens_per_step = (
         train_config.batch_size
         * train_config.grad_accum_steps
@@ -445,7 +496,7 @@ def main(
                 "val_bin": str(Path(train_config.data_dir) / "val.bin"),
                 "tokenizer_name": train_config.tokenizer_name,
             },
-            parent_checkpoint=train_config.resume_from,
+            parent_checkpoint=train_config.init_from or train_config.resume_from,
             required=(),
         )
         artifacts.record_resume(
@@ -949,3 +1000,22 @@ def _report_sweep(
 
 if __name__ == "__main__":
     main(*parse_configs())
+
+
+def raw_state_dict(model: torch.nn.Module) -> dict:
+    """Returns a state dict from a model that may be wrapped.
+
+    Args:
+        model: A model, possibly wrapped by ``DistributedDataParallel`` or
+            ``torch.compile``.
+
+    Returns:
+        The underlying module's state dict, with no ``module.`` or ``_orig_mod.``
+        prefixes. A parent checkpoint carrying wrapper prefixes cannot be loaded
+        by an unwrapped model, which would make the common-parent guarantee fail
+        exactly when a run was distributed.
+    """
+    inner = model
+    for attribute in ("module", "_orig_mod"):
+        inner = getattr(inner, attribute, inner)
+    return inner.state_dict()

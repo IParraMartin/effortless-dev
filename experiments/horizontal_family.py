@@ -244,6 +244,7 @@ def score_bits_per_byte(
     workload: Workload,
     batch_size: int = 8,
     device: str = "cpu",
+    pad_id: int = 0,
 ) -> dict:
     """Scores each request's continuation in bits per byte.
 
@@ -259,6 +260,9 @@ def score_bits_per_byte(
         workload: Requests carrying decoded text and byte lengths.
         batch_size: Requests per forward pass.
         device: Device to score on.
+        pad_id: Unused, retained so existing callers keep working. Nothing is
+            padded: requests are grouped by encoded length instead, because a
+            padded batch was measured to change real-token logits.
 
     Returns:
         A mapping with per-request ``bits_per_byte``, ``nll_sum``,
@@ -275,45 +279,70 @@ def score_bits_per_byte(
             "so continuation byte lengths are available."
         )
 
-    per_request_bpb: list[float] = []
-    per_request_nll: list[float] = []
-    scored_tokens: list[int] = []
+    encoded = []
+    for row in range(len(workload)):
+        prompt, continuation = workload.texts[row]
+        prompt_ids = tokenizer(prompt, return_tensors=None)["input_ids"]
+        full_ids = tokenizer(prompt + continuation, return_tensors=None)["input_ids"]
+        encoded.append((full_ids, len(prompt_ids)))
+
+    per_request_bpb: list[float] = [float("nan")] * len(workload)
+    per_request_nll: list[float] = [float("nan")] * len(workload)
+    scored_tokens: list[int] = [0] * len(workload)
     started = time.perf_counter()
 
-    for start in range(0, len(workload), batch_size):
-        rows = range(start, min(start + batch_size, len(workload)))
-        for row in rows:
-            prompt, continuation = workload.texts[row]
-            prompt_ids = tokenizer(prompt, return_tensors=None)["input_ids"]
-            full_ids = tokenizer(prompt + continuation, return_tensors=None)[
-                "input_ids"
-            ]
-            boundary = len(prompt_ids)
-            if boundary >= len(full_ids):
-                # Re-encoding merged the boundary token, leaving no continuation
-                # to score. Recorded as missing rather than as zero loss.
-                per_request_bpb.append(float("nan"))
-                per_request_nll.append(float("nan"))
-                scored_tokens.append(0)
-                continue
+    # Grouped by encoded length, so no batch ever contains padding.
+    #
+    # Padding was the first suspect and is not the culprit: trailing pads cannot
+    # leak through causal attention, and masked padded logits were measured
+    # bit-identical to unpadded ones. Grouping is kept anyway because it removes
+    # the attention-mask code path entirely.
+    #
+    # The residual effect is the environment, not this code. On pythia-70m in
+    # fp32 on CPU, scoring the same request in a batch of five rather than alone
+    # shifted its total NLL by up to 1.3 nats out of ~50 (2.6%), with per-logit
+    # differences up to 1.0. The model is deterministic -- two identical calls
+    # agree to the bit -- and batching *identical* rows is exact, so the cause is
+    # GEMM kernel selection changing the accumulation order with the batch
+    # dimension. It is therefore not removable from here.
+    #
+    # Consequence, recorded in the manifest rather than hidden: absolute
+    # bits-per-byte depends on batch_size at the 1e-2 level. Every tier in one
+    # manifest is scored at the same batch_size, so the *frontier* is internally
+    # consistent; a number from one batch_size must not be compared against a
+    # number from another. Score with --batch_size 1 for a batch-independent
+    # value, at proportionate cost.
+    groups: dict[int, list[int]] = {}
+    for row, (full_ids, boundary) in enumerate(encoded):
+        # Re-encoding can merge the prompt/continuation boundary, leaving nothing
+        # to score. Left as NaN rather than zero loss, which would read as a
+        # perfect prediction.
+        if boundary < len(full_ids):
+            groups.setdefault(len(full_ids), []).append(row)
 
-            ids = torch.tensor([full_ids], device=device)
-            logits = model(ids).logits[0, :-1].float()
-            gold = ids[0, 1:]
+    for length, members in sorted(groups.items()):
+        for start in range(0, len(members), batch_size):
+            rows = members[start : start + batch_size]
+            ids = torch.tensor(
+                [encoded[row][0] for row in rows], dtype=torch.long, device=device
+            )
+            logits = model(ids).logits[:, :-1].float()
+            gold = ids[:, 1:]
             per_token = torch.nn.functional.cross_entropy(
-                logits, gold, reduction="none"
+                logits.transpose(1, 2), gold, reduction="none"
             )
-            # Positions predicting continuation tokens: the token at index
-            # `boundary` is the first continuation token, predicted from index
-            # boundary - 1.
-            tail = per_token[boundary - 1 :]
-            total = float(tail.sum())
 
-            per_request_nll.append(total)
-            scored_tokens.append(int(tail.numel()))
-            per_request_bpb.append(
-                total / (math.log(2.0) * workload.continuation_bytes[row])
-            )
+            for index, row in enumerate(rows):
+                boundary = encoded[row][1]
+                # The token at index `boundary` is the first continuation token,
+                # predicted from position `boundary - 1`.
+                tail = per_token[index, boundary - 1 :]
+                total = float(tail.sum())
+                per_request_nll[row] = total
+                scored_tokens[row] = int(tail.numel())
+                per_request_bpb[row] = total / (
+                    math.log(2.0) * workload.continuation_bytes[row]
+                )
 
     return {
         "bits_per_byte": per_request_bpb,
@@ -420,7 +449,12 @@ def score_family(config: FamilyConfig) -> tuple[list[ModelResult], dict]:
         profile: dict[str, dict[str, float]] = {}
         for bucket, shape in zip(buckets, shapes):
             scored = score_bits_per_byte(
-                model, tokenizer, bucket, config.batch_size, config.device
+                model,
+                tokenizer,
+                bucket,
+                config.batch_size,
+                config.device,
+                pad_id=tokenizer.pad_token_id or tokenizer.eos_token_id or 0,
             )
             quality.extend(scored["bits_per_byte"])
             hashes.extend(bucket.text_hashes)
@@ -468,6 +502,15 @@ def score_family(config: FamilyConfig) -> tuple[list[ModelResult], dict]:
         "hardware": hardware(),
         "dtype": config.dtype,
         "requests": sum(len(bucket) for bucket in buckets),
+        "batch_size": config.batch_size,
+        "batch_sensitivity_note": (
+            "absolute bits-per-byte depends on batch_size: fp32 GEMM kernel "
+            "selection varies with the batch dimension, measured at up to 2.6% "
+            "of one request's total NLL on pythia-70m on CPU. Every tier here was "
+            "scored at the same batch_size so the frontier is internally "
+            "consistent, but a value from a different batch_size is not "
+            "comparable. --batch_size 1 gives a batch-independent number."
+        ),
         "shapes": [shape.label() for shape in shapes],
         "seed": config.seed,
     }
