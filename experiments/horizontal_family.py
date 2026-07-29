@@ -113,6 +113,13 @@ class FamilyConfig:
 
     Attributes:
         models: Model ids, ascending in capacity.
+        revisions: Git revision per model, aligned with ``models``. Pythia
+            publishes intermediate checkpoints as revisions, so this is what makes
+            the *token budget* matchable: ``step1000`` is 2.097B tokens, against
+            300B at the default ``main``. Comparing a 2.5B-token backbone against
+            final Pythia measures 120x more data, not capacity sharing. Empty
+            means ``main`` for every model, which is almost never the controlled
+            choice.
         data: Tokenized corpus the requests are drawn from.
         eos_id: End-of-text token of *that* corpus, for document boundaries.
         shapes: Request shapes, matching the vertical collection.
@@ -129,6 +136,7 @@ class FamilyConfig:
     """
 
     models: tuple[str, ...] = PYTHIA_SUITE[:3]
+    revisions: tuple[str, ...] = ()
     data: str = "data/val.bin"
     eos_id: int | None = None
     shapes: tuple[str, ...] = ("64:32", "128:64", "256:128")
@@ -154,6 +162,9 @@ class ModelResult:
         text_hashes: Digest of each continuation, proving what was scored.
         cost_profile: Measured MACs and wall time per request shape.
         tier: Rank within the family, ascending in capacity.
+        revision: Checkpoint revision scored, or ``None`` for the final one.
+        training_tokens: Tokens that checkpoint had seen, so a budget match is
+            checkable rather than asserted.
     """
 
     model_id: str
@@ -164,6 +175,8 @@ class ModelResult:
     text_hashes: list[str]
     cost_profile: dict[str, dict[str, float]] = field(default_factory=dict)
     tier: int = 0
+    revision: str | None = None
+    training_tokens: int | None = None
 
 
 #: Text encoded to fingerprint a tokenizer. Fixed, and deliberately mixed —
@@ -198,13 +211,39 @@ def tokenizer_fingerprint(tokenizer) -> str:
     )
 
 
-def load_family_model(model_id: str, device: str, dtype: str):
+#: Tokens per optimizer step in Pythia's published training run: 1024 sequences
+#: of 2048 tokens. Used only to convert a revision into a budget for the record.
+PYTHIA_TOKENS_PER_STEP = 1024 * 2048
+
+
+def revision_tokens(revision: str | None) -> int | None:
+    """Converts a Pythia revision into the token budget it represents.
+
+    Args:
+        revision: A revision such as ``"step1000"``, or ``None``/``"main"``.
+
+    Returns:
+        Tokens seen at that checkpoint, or ``None`` when the revision does not
+        encode a step. Recorded so a reader can check the budget match rather
+        than trust it.
+    """
+    if not revision or revision == "main":
+        return None
+    if revision.startswith("step") and revision[4:].isdigit():
+        return int(revision[4:]) * PYTHIA_TOKENS_PER_STEP
+    return None
+
+
+def load_family_model(
+    model_id: str, device: str, dtype: str, revision: str | None = None
+):
     """Loads one member of the family.
 
     Args:
         model_id: Hub id.
         device: Device to place it on.
         dtype: ``"fp32"``, ``"bf16"`` or ``"fp16"``.
+        revision: Git revision, for scoring an intermediate checkpoint.
 
     Returns:
         A tuple ``(model, tokenizer)``, the model in eval mode with gradients
@@ -231,8 +270,11 @@ def load_family_model(model_id: str, device: str, dtype: str):
         "fp16": torch.float16,
     }[dtype]
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch_dtype)
+    extra = {"revision": revision} if revision else {}
+    tokenizer = AutoTokenizer.from_pretrained(model_id, **extra)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, dtype=torch_dtype, **extra
+    )
     model.to(device).eval().requires_grad_(False)
     return model, tokenizer
 
@@ -437,10 +479,27 @@ def score_family(config: FamilyConfig) -> tuple[list[ModelResult], dict]:
     if config.trajectories:
         check_requests_match(buckets, config.trajectories)
 
+    if config.revisions and len(config.revisions) != len(config.models):
+        raise ValueError(
+            f"revisions has {len(config.revisions)} entries for "
+            f"{len(config.models)} models. Give one per model, or none at all -- "
+            f"a partial list would silently score some tiers at a different "
+            f"budget from others."
+        )
+
     results: list[ModelResult] = []
     for tier, model_id in enumerate(config.models):
-        print(f"scoring {model_id} ...", flush=True)
-        model, tokenizer = load_family_model(model_id, config.device, config.dtype)
+        revision = config.revisions[tier] if config.revisions else None
+        budget = revision_tokens(revision)
+        label = f"{model_id}@{revision}" if revision else model_id
+        print(
+            f"scoring {label}"
+            f"{f' ({budget / 1e9:.3f}B tokens)' if budget else ''} ...",
+            flush=True,
+        )
+        model, tokenizer = load_family_model(
+            model_id, config.device, config.dtype, revision
+        )
         parameters = sum(p.numel() for p in model.parameters())
         resident = sum(p.numel() * p.element_size() for p in model.parameters())
 
@@ -471,7 +530,7 @@ def score_family(config: FamilyConfig) -> tuple[list[ModelResult], dict]:
 
         results.append(
             ModelResult(
-                model_id=model_id,
+                model_id=label,
                 tokenizer_id=tokenizer_fingerprint(tokenizer),
                 parameters=parameters,
                 resident_bytes=resident,
@@ -479,6 +538,8 @@ def score_family(config: FamilyConfig) -> tuple[list[ModelResult], dict]:
                 text_hashes=hashes,
                 cost_profile=profile,
                 tier=tier,
+                revision=revision,
+                training_tokens=budget,
             )
         )
         del model
@@ -592,6 +653,8 @@ def write_manifest(
                 "request_hashes": str(out / f"{slug}.hashes.json"),
                 "parameters": result.parameters,
                 "resident_bytes": result.resident_bytes,
+                "revision": result.revision,
+                "training_tokens": result.training_tokens,
                 "quality_unit": metadata["quality_unit"],
                 "quality_direction": metadata["quality_direction"],
                 "family": metadata["family"],
@@ -622,13 +685,15 @@ def report(results: list[ModelResult], metadata: dict) -> str:
         f"Quality is **bits per byte**, lower better — the only unit comparable "
         f"against a model that uses a different tokenizer.",
         "",
-        "| model | parameters | resident | bits/byte |",
-        "|---|---:|---:|---:|",
+        "| model | parameters | tokens seen | resident | bits/byte |",
+        "|---|---:|---:|---:|---:|",
     ]
     for result in results:
         finite = [v for v in result.bits_per_byte if v == v]
         lines.append(
             f"| {result.model_id} | {result.parameters / 1e6:,.1f}M | "
+            f"{'' if result.training_tokens is None else f'{result.training_tokens / 1e9:.3f}B'}"
+            f"{'' if result.training_tokens is not None else 'final'} | "
             f"{result.resident_bytes / 1e6:,.0f} MB | "
             f"{np.mean(finite):.4f} |"
         )
@@ -715,6 +780,15 @@ def parse_args(argv: list[str] | None = None) -> FamilyConfig:
         default=",".join(PYTHIA_SUITE[:3]),
         help="Comma-separated hub ids, ascending in capacity.",
     )
+    parser.add_argument(
+        "--revisions",
+        default="",
+        help=(
+            "Comma-separated git revision per model, e.g. 'step1000,step1000'. "
+            "Pythia's intermediate checkpoints are what make the token budget "
+            "matchable: step1000 is 2.097B tokens against 300B at main."
+        ),
+    )
     parser.add_argument("--data", default="data/val.bin")
     parser.add_argument("--eos_id", type=int, default=None)
     parser.add_argument("--shapes", default="64:32,128:64,256:128")
@@ -739,6 +813,9 @@ def parse_args(argv: list[str] | None = None) -> FamilyConfig:
     config = FamilyConfig(
         models=tuple(
             part.strip() for part in parsed.models.split(",") if part.strip()
+        ),
+        revisions=tuple(
+            part.strip() for part in parsed.revisions.split(",") if part.strip()
         ),
         data=parsed.data,
         eos_id=parsed.eos_id,
