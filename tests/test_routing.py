@@ -517,6 +517,45 @@ class ControllerBehaviour(unittest.TestCase):
         )
         torch.testing.assert_close(seen[0], expected)
 
+    def test_probe_prefix_is_reused_instead_of_recomputed(self) -> None:
+        """Every prompt token should traverse each selected block at most once."""
+        model = tiny_model()
+        routing = RoutingConfig(
+            routing_mode="request", probe_depth=2, depth_tiers=(2, 4, 6)
+        )
+        model.attach_router(routing, ScriptedController([2, 4, 6]))
+
+        token_visits = [0] * model.config.n_layers
+        handles = []
+        for layer, block in enumerate(model.blocks):
+            def count(_module, args, _output, layer=layer):
+                hidden = args[0]
+                token_visits[layer] += hidden.size(0) * hidden.size(1)
+
+            handles.append(block.register_forward_hook(count))
+
+        try:
+            prompt_len = 5
+            out = model.generate_routed(
+                torch.randint(0, 64, (3, prompt_len)),
+                max_new_tokens=1,
+                temperature=0.0,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        # All three requests run the two-block probe, two continue to depth 4,
+        # and one continues to depth 6. A recomputed probe would double the
+        # first two entries while the counters still reported these values.
+        self.assertEqual(
+            token_visits,
+            [3 * prompt_len, 3 * prompt_len,
+             2 * prompt_len, 2 * prompt_len,
+             1 * prompt_len, 1 * prompt_len],
+        )
+        self.assertEqual(out.counters.total_block_executions, sum(token_visits))
+
     def test_selection_is_deterministic_in_eval_mode(self) -> None:
         """Requirement 9."""
         model = tiny_model()

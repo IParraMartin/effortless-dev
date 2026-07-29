@@ -46,7 +46,7 @@ from experiments.collect_depth_trajectories import load
 from utils.provenance import RunRecord
 
 #: Version of the saved controller layout.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: Quality columns a trajectory record can supply, and whether larger is better.
 QUALITY_METRICS = {
@@ -626,6 +626,17 @@ def run(config: ControllerTrainConfig) -> dict:
             "calibration": len(calibration_rows),
             "report": len(report_rows),
         },
+        # Persist identities, not only counts. The evaluator must run every
+        # baseline on the untouched reporting half; using all validation rows
+        # would leak the ordinal threshold's calibration examples back into the
+        # headline comparison.
+        "split_request_ids": {
+            "train": [records[row]["request_id"] for row in train_rows],
+            "calibration": [
+                records[row]["request_id"] for row in calibration_rows
+            ],
+            "report": [records[row]["request_id"] for row in report_rows],
+        },
     }
 
 
@@ -694,6 +705,7 @@ def save(results: dict, config: ControllerTrainConfig, record: RunRecord) -> Pat
                 "output": controller.output,
                 "tiers": results["tiers"],
                 "train_config": asdict(config),
+                "split_request_ids": results["split_request_ids"],
                 "metrics": {
                     k: v for k, v in entry.items() if k != "confusion"
                 },
@@ -707,6 +719,7 @@ def save(results: dict, config: ControllerTrainConfig, record: RunRecord) -> Pat
         payload={
             "tiers": results["tiers"],
             "splits": results["splits"],
+            "split_request_ids": results["split_request_ids"],
             "per_seed": summary,
             "trajectory_metadata": results["metadata"],
         },

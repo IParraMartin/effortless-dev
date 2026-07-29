@@ -151,6 +151,7 @@ def evaluate(
     config: TrainConfig,
     device: torch.device,
     autocast,
+    context: distributed.DistributedContext | None = None,
 ) -> tuple[float, dict[int, float]]:
     """Measures loss on held-out data.
 
@@ -160,15 +161,20 @@ def evaluate(
         config: Run settings supplying ``eval_steps``.
         device: Device to move batches to.
         autocast: Context manager applying the configured precision.
+        context: Distributed context. When present, loss sums and counts are
+            reduced across every rank before reporting; without this, rank zero
+            would log only its validation shard.
 
     Returns:
         A tuple ``(mean_loss, mean_exit_losses)`` where the second element maps
         each exit's layer index to its own cross-entropy. Every exit appears,
         not the rotating subset training scores.
     """
+    was_training = model.training
     model.eval()
     total = 0.0
-    per_exit: dict[int, list[float]] = {}
+    per_exit_total: dict[int, float] = {}
+    per_exit_count: dict[int, int] = {}
     batches = 0
 
     # Every exit, not the step's rotation. The rotation is deterministic in the
@@ -187,15 +193,47 @@ def evaluate(
                 out = model(inputs, targets=targets)
             total += float(out.loss)
             for layer, value in out.exit_losses.items():
-                per_exit.setdefault(layer, []).append(value)
+                per_exit_total[layer] = per_exit_total.get(layer, 0.0) + value
+                per_exit_count[layer] = per_exit_count.get(layer, 0) + 1
             batches += 1
 
-    model.train()
-    if batches == 0:
+    model.train(was_training)
+
+    # Every rank receives a disjoint validation shard. Reduce numerators and
+    # denominators separately so rank zero reports the whole held-out sample,
+    # not whichever shard happened to be assigned rank zero. ``reduce_mean`` is
+    # sufficient because the common world-size factor cancels in the ratio.
+    aggregate = torch.tensor(
+        [total, float(batches)], dtype=torch.float64, device=device
+    )
+    if context is not None:
+        aggregate = distributed.reduce_mean(aggregate, context)
+
+    global_batches = float(aggregate[1])
+    if global_batches == 0:
         return float("nan"), {}
-    return total / batches, {
-        layer: sum(values) / len(values) for layer, values in per_exit.items()
+
+    layers = model.config.exit_layers
+    exit_sums = torch.tensor(
+        [per_exit_total.get(layer, 0.0) for layer in layers],
+        dtype=torch.float64,
+        device=device,
+    )
+    exit_counts = torch.tensor(
+        [per_exit_count.get(layer, 0) for layer in layers],
+        dtype=torch.float64,
+        device=device,
+    )
+    if context is not None:
+        exit_sums = distributed.reduce_mean(exit_sums, context)
+        exit_counts = distributed.reduce_mean(exit_counts, context)
+
+    means = {
+        layer: float(exit_sums[index] / exit_counts[index])
+        for index, layer in enumerate(layers)
+        if float(exit_counts[index]) > 0.0
     }
+    return float(aggregate[0] / aggregate[1]), means
 
 
 def main(
@@ -407,7 +445,12 @@ def main(
 
         if train_config.eval_every and completed % train_config.eval_every == 0:
             val_loss, val_exits = evaluate(
-                raw_model, val_loader, train_config, device, autocast
+                raw_model,
+                val_loader,
+                train_config,
+                device,
+                autocast,
+                context,
             )
             if context.is_main:
                 summary = " ".join(

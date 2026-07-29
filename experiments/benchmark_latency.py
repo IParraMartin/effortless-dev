@@ -215,8 +215,12 @@ def time_generation(
         config: Benchmark settings.
 
     Returns:
-        A tuple ``(ttft, tpot, total)`` of per-repetition milliseconds, where
-        ``tpot`` is per generated token after the first.
+        A tuple ``(ttft, tpot, total)`` of per-repetition milliseconds.
+        ``ttft`` is measured by a one-token invocation, ``total`` is the full
+        ``new_tokens`` invocation, and ``tpot`` is their difference divided by
+        the remaining output tokens. The first two therefore come from matched
+        but separate calls; a production benchmark should additionally
+        instrument prefill and decode inside one invocation.
     """
     device = prompts.device
 
@@ -283,7 +287,11 @@ def measure(
     out = model.generate_routed(
         prompts, max_new_tokens=new_tokens, temperature=0.0
     )
-    median_total = percentile(total, 0.5) + percentile(ttft, 0.5)
+    # ``total`` already times the complete ``new_tokens`` call. It used to have
+    # TTFT added a second time here even though the full call necessarily paid
+    # its own prefill and first-token latency, inflating end-to-end latency and
+    # depressing throughput for every benchmark row.
+    median_total = percentile(total, 0.5)
 
     return Measurement(
         depth=depth,
@@ -295,7 +303,7 @@ def measure(
         tpot_p50=percentile(tpot, 0.5),
         tpot_p95=percentile(tpot, 0.95),
         total_p50=median_total,
-        total_p95=percentile(total, 0.95) + percentile(ttft, 0.95),
+        total_p95=percentile(total, 0.95),
         tokens_per_second=(
             batch_size * new_tokens / max(median_total / 1e3, 1e-9)
         ),

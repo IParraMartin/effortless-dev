@@ -4,8 +4,10 @@ import unittest
 
 import torch
 
+from experiments.collect_depth_trajectories import tier_costs
 from src.config import TransformerConfig
 from src.model import Transformer
+from utils.costs import AnalyticalCostModel
 
 
 def config(**updates) -> TransformerConfig:
@@ -25,6 +27,69 @@ def config(**updates) -> TransformerConfig:
 
 
 class RegressionTests(unittest.TestCase):
+    def test_one_generated_token_costs_no_decode_forward(self) -> None:
+        cfg = config(learned_kv_propagation=False)
+        depth = 4
+        prompt_len = 7
+        analytical = AnalyticalCostModel.from_config(cfg)
+
+        measured = tier_costs(cfg, (depth,), prompt_len, generated=1)["macs"][0]
+        expected = (
+            analytical.prefill_macs(depth, prompt_len)
+            + analytical.head_macs
+        )
+        self.assertEqual(measured, expected)
+
+    def test_generated_token_cost_has_exactly_n_minus_one_decode_forwards(self) -> None:
+        cfg = config(learned_kv_propagation=False)
+        depth = 4
+        prompt_len = 7
+        generated = 3
+        analytical = AnalyticalCostModel.from_config(cfg)
+
+        measured = tier_costs(
+            cfg, (depth,), prompt_len, generated=generated
+        )["macs"][0]
+        expected = analytical.prefill_macs(depth, prompt_len)
+        expected += analytical.decode_macs(depth, prompt_len + 1)
+        expected += analytical.decode_macs(depth, prompt_len + 2)
+        expected += generated * analytical.head_macs
+        self.assertEqual(measured, expected)
+
+    def test_backbone_initialization_does_not_depend_on_exit_density(self) -> None:
+        """Matched arms with the same seed must share one starting backbone."""
+        torch.manual_seed(123)
+        dense = Transformer(config(exit_every=1))
+        dense_next_draw = torch.rand(8)
+
+        torch.manual_seed(123)
+        final_only = Transformer(config(exit_every=6))
+        final_only_next_draw = torch.rand(8)
+
+        torch.testing.assert_close(dense.embed.weight, final_only.embed.weight)
+        for dense_block, final_block in zip(dense.blocks, final_only.blocks):
+            for dense_parameter, final_parameter in zip(
+                dense_block.parameters(), final_block.parameters()
+            ):
+                torch.testing.assert_close(dense_parameter, final_parameter)
+
+        # Construction must not leave data shuffling, dropout, or any other
+        # later stochastic path at a different point in the RNG stream.
+        torch.testing.assert_close(dense_next_draw, final_only_next_draw)
+
+    def test_same_layer_untied_exit_initializes_identically_across_arms(self) -> None:
+        torch.manual_seed(321)
+        dense = Transformer(config(exit_every=1, tie_embeddings=False))
+        torch.manual_seed(321)
+        sparse = Transformer(config(exit_every=3, tie_embeddings=False))
+
+        for layer in set(dense.config.exit_layers) & set(sparse.config.exit_layers):
+            dense_exit = dense.exit_modules[dense.exit_index[layer]]
+            sparse_exit = sparse.exit_modules[sparse.exit_index[layer]]
+            torch.testing.assert_close(
+                dense_exit.proj.weight, sparse_exit.proj.weight
+            )
+
     def test_kv_adapters_start_as_exact_identity(self) -> None:
         model = Transformer(config())
         for block in model.blocks:

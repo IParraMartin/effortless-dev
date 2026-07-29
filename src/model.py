@@ -559,12 +559,23 @@ class Transformer(nn.Module):
         self.blocks = nn.ModuleList(
             DecoderBlock(self.config, i) for i in range(self.config.n_layers)
         )
-        self.exit_modules = nn.ModuleList(
-            ExitModule(
-                self.config.d_model, self.config.vocab_size, self.config.norm_eps
+        # ``nn.Linear`` initializes itself in its constructor.  The number of
+        # exits therefore used to advance the global RNG by a different amount
+        # before the backbone's explicit initialization pass.  Two arms built
+        # with the same seed but different ``exit_every`` values consequently
+        # started from different embeddings and blocks, which confounded any
+        # comparison attributed to the exit objective.  Isolate constructor
+        # draws here; the exits receive their configured initialization below
+        # without perturbing the caller's RNG either.
+        with torch.random.fork_rng(devices=[]):
+            self.exit_modules = nn.ModuleList(
+                ExitModule(
+                    self.config.d_model,
+                    self.config.vocab_size,
+                    self.config.norm_eps,
+                )
+                for _ in self.config.exit_layers
             )
-            for _ in self.config.exit_layers
-        )
         #: Maps a layer index to its position in :attr:`exit_modules`.
         self.exit_index = {
             layer: i for i, layer in enumerate(self.config.exit_layers)
@@ -592,8 +603,22 @@ class Transformer(nn.Module):
         self.routing: RoutingConfig | None = None
         self.depth_controller: DepthController | None = None
 
-        self.apply(self._init_weights)
+        # Initialize the shared backbone independently of how many exits are
+        # attached.  Applying over ``self`` would visit the exit modules too,
+        # making the post-construction RNG state depend on the experiment arm.
+        self.embed.apply(self._init_weights)
+        self.blocks.apply(self._init_weights)
         self._scale_residual_projections()
+
+        # Give an untied exit at a given layer the same initialization in every
+        # exit-density arm, while restoring the global RNG afterwards.  Tied
+        # heads are replaced by ``self.embed.weight`` below, but keeping this
+        # correct also protects the supported ``tie_embeddings=False`` case.
+        exit_seed = torch.initial_seed()
+        for layer, exit_module in zip(self.config.exit_layers, self.exit_modules):
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(exit_seed + 1_000_003 + layer)
+                exit_module.apply(self._init_weights)
         # ``Module.apply`` also visits propagation adapters and would overwrite
         # their deliberate zero initialization. Restore exact identity after the
         # model-wide initialization pass.
@@ -1945,7 +1970,13 @@ class Transformer(nn.Module):
 
         for length, rows in self._row_groups(prompt_lengths):
             prompt = input_ids[rows, :length]
-            chosen, group_scores, reason, probed = self._route_group(
+            (
+                chosen,
+                group_scores,
+                reason,
+                probe_state,
+                probe_cache,
+            ) = self._route_group(
                 prompt, length, routing, routing_lambda, depth, counters
             )
 
@@ -1959,19 +1990,29 @@ class Transformer(nn.Module):
             # total block count right but split it wrongly, and the probe cost
             # is exactly the number a reader uses to judge whether routing is
             # worth its overhead.
-            probe_depth = (
-                min(routing.probe_depth, int(chosen.min())) if probed else 0
-            )
+            probe_depth = routing.probe_depth if probe_state is not None else 0
             if probe_depth:
                 counters.record_prefill(probe_depth, length, rows.numel())
                 trace.probe_blocks += probe_depth * length * rows.numel()
 
             for tier, local in self._row_groups(chosen):
                 bucket = rows[local]
+                bucket_probe = (
+                    probe_state.hidden.index_select(0, local)
+                    if probe_state is not None
+                    else None
+                )
+                bucket_cache = (
+                    probe_cache.select_rows(local, max_depth=tier)
+                    if probe_cache is not None
+                    else None
+                )
                 generated, bucket_kv, bucket_boundary = self._generate_bucket(
                     input_ids[bucket, :length],
                     tier,
                     probe_depth,
+                    bucket_probe,
+                    bucket_cache,
                     routing,
                     max_new_tokens,
                     temperature,
@@ -2027,7 +2068,13 @@ class Transformer(nn.Module):
         routing_lambda: float | None,
         forced_depth: int | None,
         counters: CostCounters,
-    ) -> tuple[torch.Tensor, torch.Tensor, str | None, bool]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        str | None,
+        DepthState | None,
+        KVCache | None,
+    ]:
         """Chooses a depth for every request in one equal-length group.
 
         Args:
@@ -2040,10 +2087,12 @@ class Transformer(nn.Module):
             counters: Counters to record the controller evaluation in.
 
         Returns:
-            A tuple ``(depths, scores, fallback_reason, probed)``. ``scores`` is
-            shaped ``(rows, n_tiers)`` and is all zeros when no controller ran;
-            ``probed`` says whether the probe blocks were executed, which is
-            what decides who pays for them.
+            A tuple ``(depths, scores, fallback_reason, probe_state,
+            probe_cache)``. ``scores`` is shaped ``(rows, n_tiers)`` and is all
+            zeros when no controller ran. The final two entries are ``None``
+            unless request routing executed the shared prompt probe; when
+            present, they are reused by the selected endpoint rather than
+            recomputed.
 
         Raises:
             ValueError: If a forced depth is not among the tiers, or if request
@@ -2059,7 +2108,8 @@ class Transformer(nn.Module):
                 torch.full((rows,), depth, dtype=torch.long, device=prompt.device),
                 empty,
                 reason,
-                False,
+                None,
+                None,
             )
 
         if forced_depth is not None:
@@ -2081,11 +2131,18 @@ class Transformer(nn.Module):
                 "Pass one to attach_router, or load one with controller_path."
             )
 
-        # The probe is the only thing the controller may see. It runs without a
-        # cache: the group is about to be split by depth, and each bucket needs
-        # its own depth-capped cache anyway, so a shared probe cache would have
-        # to be sliced apart immediately.
-        probe = self.forward_to_depth(prompt, routing.probe_depth)
+        # The probe is the only thing the controller may see.  Its prompt work
+        # is also the prefix every selected endpoint needs, so retain both the
+        # hidden state and its exact K/V entries.  ``KVCache.select_rows`` then
+        # splits this shared prefix into independently depth-capped buckets.
+        # Recomputing the probe after routing would make the advertised reuse a
+        # bookkeeping fiction and understate actual prefill work.
+        probe_cache = KVCache(
+            self.config.n_layers, max_depth=routing.probe_depth
+        )
+        probe = self.forward_to_depth(
+            prompt, routing.probe_depth, cache=probe_cache
+        )
         features = pool_prompt_features(
             probe.hidden,
             lengths=None,
@@ -2111,13 +2168,15 @@ class Transformer(nn.Module):
             if bool(raised.any()):
                 depths = depths.clamp(min=routing.safety_depth)
                 reason = "safety_depth_floor"
-        return depths, scores, reason, True
+        return depths, scores, reason, probe, probe_cache
 
     def _generate_bucket(
         self,
         prompt: torch.Tensor,
         depth: int,
         probe_depth: int,
+        probe_hidden: torch.Tensor | None,
+        cache: KVCache | None,
         routing: RoutingConfig,
         max_new_tokens: int,
         temperature: float,
@@ -2134,6 +2193,10 @@ class Transformer(nn.Module):
             prompt: Prompts shaped ``(rows, length)``.
             depth: Executed depth for this bucket.
             probe_depth: Blocks already accounted for by the probe.
+            probe_hidden: Probe boundary for these rows, or ``None`` when no
+                controller probe ran.
+            cache: Probe K/V entries expanded to this bucket's depth cap, or
+                ``None`` when no controller probe ran.
             routing: Resolved routing settings.
             max_new_tokens: Tokens to generate.
             temperature: Sampling temperature.
@@ -2149,17 +2212,36 @@ class Transformer(nn.Module):
             shaped ``(rows, generated)``.
         """
         rows, length = prompt.shape
-        cache = KVCache(self.config.n_layers, max_depth=depth)
+        if probe_hidden is None:
+            if cache is not None or probe_depth:
+                raise ValueError(
+                    "probe cache/depth were supplied without probe hidden states"
+                )
+            cache = KVCache(self.config.n_layers, max_depth=depth)
+            state = self.forward_to_depth(
+                prompt,
+                depth,
+                cache=cache,
+                return_boundary_state=routing.retain_boundary_state,
+            )
+        else:
+            if cache is None:
+                raise ValueError("probe hidden states require their K/V cache")
+            if probe_hidden.shape[:2] != prompt.shape:
+                raise ValueError(
+                    "probe hidden states must cover every row and prompt token"
+                )
+            state = self.continue_from_depth(
+                probe_hidden,
+                probe_depth,
+                depth,
+                cache=cache,
+                offset=0,
+                return_boundary_state=routing.retain_boundary_state,
+            )
 
-        state = self.forward_to_depth(
-            prompt,
-            depth,
-            cache=cache,
-            return_boundary_state=routing.retain_boundary_state,
-        )
-        # The probe blocks were already counted for the whole group, so only
-        # the remainder is charged here. Double counting them would make deep
-        # routes look cheaper than they are relative to shallow ones.
+        # The probe blocks were both executed and counted for the whole group;
+        # this bucket executes and charges only the suffix above them.
         counters.record_prefill(
             depth, length, rows, start_depth=min(probe_depth, depth)
         )

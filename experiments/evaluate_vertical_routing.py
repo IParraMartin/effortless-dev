@@ -75,7 +75,7 @@ from utils.statistics import (
 )
 
 #: Version of the evaluation record layout.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -86,6 +86,8 @@ class EvaluationConfig:
         trajectories: Directory of collected trajectories.
         controller: Directory of trained controllers, or ``None`` to evaluate
             only the systems that need no controller.
+        controller_seed: Exact controller fit to evaluate. Selecting a seed by
+            filename order after seeing results is not a predeclared policy.
         manifest: JSON manifest describing independently trained models. Absent
             means the horizontal side is not evaluated, and is reported as not
             evaluated rather than quietly skipped.
@@ -102,6 +104,7 @@ class EvaluationConfig:
 
     trajectories: str = "results/trajectories"
     controller: str | None = "results/controller"
+    controller_seed: int = 0
     manifest: str | None = None
     out: str = "results/evaluation"
     quality_metric: str = "teacher_forced_accuracy"
@@ -180,6 +183,55 @@ def load_controller(path: str | Path) -> tuple[DepthController, dict]:
     controller.load_state_dict(blob["state_dict"])
     controller.eval()
     return controller, blob
+
+
+def controller_report_rows(records: list[dict], blob: dict) -> list[int]:
+    """Resolves the untouched reporting split stored with a controller.
+
+    Args:
+        records: Trajectory records containing unique ``request_id`` values.
+        blob: Loaded controller checkpoint.
+
+    Returns:
+        Row indices in the controller's recorded reporting order.
+
+    Raises:
+        ValueError: If the checkpoint predates split identities, references
+            absent requests, duplicates request ids, or includes non-validation
+            examples.
+    """
+    split_ids = blob.get("split_request_ids", {})
+    report_ids = split_ids.get("report")
+    if report_ids is None:
+        raise ValueError(
+            "Controller checkpoint does not record its reporting request ids. "
+            "Refit it with controller schema 2 before evaluating; using the "
+            "whole validation split would mix calibration and reporting "
+            "examples."
+        )
+
+    by_request_id: dict[int, int] = {}
+    for row, record in enumerate(records):
+        request_id = record["request_id"]
+        if request_id in by_request_id:
+            raise ValueError(f"Duplicate trajectory request_id {request_id}.")
+        by_request_id[request_id] = row
+
+    missing = [request_id for request_id in report_ids
+               if request_id not in by_request_id]
+    if missing:
+        raise ValueError(
+            f"Controller reporting split contains {len(missing)} request "
+            f"id(s) absent from these trajectories, starting with "
+            f"{missing[:3]}."
+        )
+
+    rows = [by_request_id[request_id] for request_id in report_ids]
+    if any(records[row].get("split") != "validation" for row in rows):
+        raise ValueError(
+            "Controller reporting ids include non-validation requests."
+        )
+    return rows
 
 
 def fixed_endpoints(
@@ -389,16 +441,18 @@ def best_static_mixture(
         quality: Quality shaped ``(n_requests, n_tiers)``.
         cost: Normalized cost, same shape.
         target_cost: Average cost to match.
-        seed: Seed for the assignment draw.
+        seed: Retained for command-line compatibility. The returned arrays use
+            the exact expectation of the randomized policy, so no assignment
+            draw (and therefore no Monte Carlo seed noise) is needed.
 
     Returns:
         The best mixture reaching that cost, or ``None`` if no pair brackets it.
     """
     mean_quality = quality.mean(axis=0)
     mean_cost = cost.mean(axis=0)
-    rng = np.random.default_rng(seed)
+    del seed
 
-    best: tuple[float, np.ndarray] | None = None
+    best: tuple[float, int, int, float] | None = None
     for low in range(quality.shape[1]):
         for high in range(quality.shape[1]):
             span = mean_cost[high] - mean_cost[low]
@@ -410,22 +464,24 @@ def best_static_mixture(
 
             value = (1 - weight) * mean_quality[low] + weight * mean_quality[high]
             if best is None or value > best[0]:
-                draw = rng.random(len(quality)) < weight
-                best = (value, np.where(draw, high, low))
+                best = (value, low, high, float(weight))
 
     if best is None:
         return None
 
-    index = best[1]
-    rows = np.arange(len(index))
+    _, low, high, weight = best
     return SystemResult(
         name="best_static_mixture",
         family="vertical",
         operating_point=float(target_cost),
-        quality=quality[rows, index],
-        cost=cost[rows, index],
-        choices=index,
-        notes=["request-independent: assigns depth by coin flip"],
+        quality=(1.0 - weight) * quality[:, low] + weight * quality[:, high],
+        cost=(1.0 - weight) * cost[:, low] + weight * cost[:, high],
+        choices=None,
+        notes=[
+            "request-independent randomized mixture, reported in expectation: "
+            f"tier-index {low} with probability {1.0 - weight:.6f}, "
+            f"tier-index {high} with probability {weight:.6f}"
+        ],
     )
 
 
@@ -798,7 +854,24 @@ def evaluate(config: EvaluationConfig) -> dict:
     records, features, metadata = load(config.trajectories)
     tiers = metadata["tiers"]
 
+    controller = None
+    controller_blob = None
+    if config.controller:
+        checkpoint = (
+            Path(config.controller)
+            / f"controller-seed{config.controller_seed}.pt"
+        )
+        if not checkpoint.exists():
+            raise ValueError(
+                f"Requested controller seed {config.controller_seed}, but "
+                f"{checkpoint} does not exist. Choose a seed before evaluation "
+                f"or train that seed; do not select one from report results."
+            )
+        controller, controller_blob = load_controller(checkpoint)
+
     rows = split_rows(records, "validation")
+    if controller_blob is not None:
+        rows = controller_report_rows(records, controller_blob)
     if not rows:
         raise ValueError(
             "No validation requests in the trajectories; nothing to evaluate."
@@ -815,18 +888,16 @@ def evaluate(config: EvaluationConfig) -> dict:
         ceiling.name = f"conditional_oracle@{lam}"
         systems.append(ceiling)
 
-    controller = None
-    if config.controller:
-        candidates = sorted(Path(config.controller).glob("controller-seed*.pt"))
-        if candidates:
-            controller, blob = load_controller(candidates[0])
-            threshold = blob["metrics"].get("sufficiency_threshold", 0.5)
-            for lam in config.lambdas:
-                system = learned_router(
-                    controller, probe, quality, cost, lam, threshold
-                )
-                system.name = f"learned_request_router@{lam}"
-                systems.append(system)
+    if controller is not None:
+        threshold = controller_blob["metrics"].get(
+            "sufficiency_threshold", 0.5
+        )
+        for lam in config.lambdas:
+            system = learned_router(
+                controller, probe, quality, cost, lam, threshold
+            )
+            system.name = f"learned_request_router@{lam}"
+            systems.append(system)
 
     # The mixture baseline is only interesting at the costs the router chose:
     # matched-cost is the whole point, and generating one at every system's
@@ -1099,6 +1170,7 @@ def parse_args(argv: list[str] | None = None) -> EvaluationConfig:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--trajectories", default="results/trajectories")
     parser.add_argument("--controller", default="results/controller")
+    parser.add_argument("--controller_seed", type=int, default=0)
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--out", default="results/evaluation")
     parser.add_argument("--quality_metric", default="teacher_forced_accuracy",

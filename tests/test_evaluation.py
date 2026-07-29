@@ -27,8 +27,10 @@ import numpy as np
 
 from experiments.evaluate_vertical_routing import (
     EvaluationConfig,
+    best_static_mixture,
     cascade_system,
     complementarity_matrix,
+    controller_report_rows,
     estimands,
     fixed_endpoints,
     horizontal_systems,
@@ -113,6 +115,39 @@ class ManifestLoading(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "same requests"):
             horizontal_systems(load_manifest(path), n_requests=8, lambdas=(0.0,))
+
+
+class StaticMixtureBaseline(unittest.TestCase):
+    """The matched-cost baseline is an exact expectation, not one noisy draw."""
+
+    def test_exact_expectation_hits_target_without_coin_flip_noise(self) -> None:
+        quality = np.array([[0.0, 1.0], [1.0, 0.0]])
+        cost = np.array([[0.2, 0.8], [0.2, 0.8]])
+
+        first = best_static_mixture(quality, cost, target_cost=0.5, seed=0)
+        second = best_static_mixture(quality, cost, target_cost=0.5, seed=999)
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(first.choices)
+        np.testing.assert_allclose(first.quality, [0.5, 0.5])
+        np.testing.assert_allclose(first.cost, [0.5, 0.5])
+        np.testing.assert_allclose(first.quality, second.quality)
+
+
+class ControllerReportingSplit(unittest.TestCase):
+    def test_uses_only_the_persisted_reporting_request_ids(self) -> None:
+        records = [
+            {"request_id": 10, "split": "validation"},
+            {"request_id": 11, "split": "validation"},
+            {"request_id": 12, "split": "validation"},
+        ]
+        blob = {"split_request_ids": {"report": [12, 10]}}
+        self.assertEqual(controller_report_rows(records, blob), [2, 0])
+
+    def test_old_checkpoint_is_rejected_instead_of_leaking_calibration(self) -> None:
+        records = [{"request_id": 0, "split": "validation"}]
+        with self.assertRaisesRegex(ValueError, "schema 2"):
+            controller_report_rows(records, {})
 
 
 class SharingTaxAlignment(unittest.TestCase):

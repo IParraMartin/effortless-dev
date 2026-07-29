@@ -310,17 +310,28 @@ def tier_costs(
 
     Returns:
         Arrays over tiers for ``macs``, ``depth_fraction``, and ``kv_bytes``.
+
+    Raises:
+        ValueError: If ``generated`` is not positive. The generation path reads
+            the first token from the prompt prefill and then performs exactly
+            ``generated - 1`` incremental decode forwards.
     """
+    if generated < 1:
+        raise ValueError(f"generated must be positive, got {generated}.")
+
     cost = AnalyticalCostModel.from_config(config)
 
     macs, kv = [], []
     for depth in tiers:
         total = cost.prefill_macs(depth, prompt_len)
-        for step in range(generated):
+        # The prefill logits emit token one. Only tokens 1 .. generated-1 are
+        # fed back through the backbone, so charging ``generated`` decode calls
+        # overstates every tier by one full incremental forward.
+        for step in range(generated - 1):
             total += cost.decode_macs(depth, prompt_len + step + 1)
         # One vocabulary projection per generated token, which is the whole
         # point of reading out only at the endpoint.
-        total += max(generated, 1) * cost.head_macs
+        total += generated * cost.head_macs
         macs.append(total)
         # One position short of prompt + generated: the last token emitted is
         # never fed back, so nothing ever attends to it and its keys and values
