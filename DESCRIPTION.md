@@ -466,3 +466,120 @@ first two are now *checkable* rather than met: exact resume is verified by test,
 and the parent's no-regret property is verified by construction in the frozen
 modes — but neither has been exercised on the cluster, and no endpoint has been
 scored on real held-out requests.
+
+---
+
+## Decision log — 2026-07-29 (real-text collection)
+
+Third entry for the date. Records the work that followed an audit of whether the
+implementation could answer the research questions. It could not, for one uniform
+reason and four specific defects, all now closed except where noted.
+
+### Material received
+
+None. No new runs, no new checkpoints. Nothing below is an empirical result.
+
+### The audit that prompted this
+
+Every one of RQ1–RQ7 routes through per-request endpoint quality, and
+`collect_depth_trajectories.collect()` built `mixed_difficulty_corpus`
+unconditionally. So all seven were blocked on one function, and the phases
+delivered before this one (P0–P2) had deferred it. That ordering came from the
+review's own priority list and from the coding-agent prompt, but it should have
+been checked against the goal before the budget was spent rather than after.
+
+Four further defects would have produced wrong answers even once real text was
+available:
+
+1. no instrument for H1 above the frozen retrofit rungs;
+2. every interval resampled requests i.i.d., so intervals over correlated
+   requests were too narrow — which for a one-sided non-inferiority test biases
+   toward *passing*;
+3. NLL stored as a per-request mean, making a corpus NLL a mean of means;
+4. the controller's live cost semantics could silently differ from the ones it
+   was selected under.
+
+### Code changed
+
+`cb42653`. `workloads.real_text_corpus`; schema 2 trajectory records carrying
+document identity and NLL sums; clustered `paired_bootstrap` and
+`non_inferiority_test` wired through the evaluation; `experiments/no_regret.py`;
+retrofit-module MACs in the cost model; `DepthController.cost_metric` enforcement;
+`retrofit.restore`; `check_corpus_compatible`.
+
+### Tests
+
+358 → 414. The no-regret failure path is unit-tested rather than demonstrated on
+a checkpoint, because an untrained toy model sits at the entropy floor: scaling
+every backbone weight by 1.35 moved its NLL by 0.0005 nats, so no fixture of that
+kind can express a regression a real margin would catch.
+
+### New observations
+
+- **Claim:** a mean of per-request NLL means is not the corpus NLL, and the gap
+  is material. On a two-shape fixture the two differed by 0.0037 nats.
+  **Scope:** arithmetic plus one fixture. Stated because the effect this project
+  is trying to measure elsewhere is 0.0744 nats, so an aggregation error of this
+  size is not negligible relative to the signal.
+
+- **Claim:** clustering changes interval width by a large factor when requests
+  repeat within a document. On constructed data with total within-cluster
+  correlation, the clustered interval is more than 1.5× wider.
+  **Artifact:** `tests/test_realtext.ClusteredIntervals`.
+
+- **Claim:** retrofit modules add 0.06% (rank-32 exit adapter, depth 2) to 0.59%
+  (rank-8 LoRA on four projections, depth 12) to endpoint MACs.
+  **Scope:** analytical, at `d_model=768`, `V=52000`. Small, and it lands on the
+  cheap end of the frontier where the shallow endpoints being justified live.
+
+### Corrected or retracted
+
+Nothing retracted. Three implementation defects found by running the new code:
+
+1. **A LoRA checkpoint could not be reloaded at all.** Wrapping a projection
+   renames its weight, so every wrapped projection read as a missing key and
+   `retrofit_parent.py` was writing checkpoints nothing could read.
+2. **The collector died mid-collection** on a shape exceeding the model's
+   context, after completing the shapes that fit — leaving output a resume would
+   treat as complete.
+3. **An out-of-vocabulary token** surfaced from inside the embedding lookup.
+
+### Experiment registry changes
+
+- **E01 unblocked.** Every depth can be scored on identical real held-out
+  requests with document-clustered intervals.
+- **E02, E03, E04, E05, E06 runnable.** The pipeline was verified end to end on a
+  fixture corpus: collection → controller → evaluation → no-regret test.
+- **E07 (independent horizontal family) is now the largest blocked item**, and it
+  blocks the paper's central claim. No independent models, no adapter for a
+  public family.
+- **E08 (serving benchmark) blocked on code** for continuous batching, depth
+  queues, goodput, energy, and counter/profiler parity.
+- **E10 gated and its gate is not implemented**: the token-level
+  outcome-oracle-gain diagnostic does not exist.
+
+### Research question status
+
+| | answerable now | blocked on |
+|---|---|---|
+| RQ1 no-regret endpoint | yes | — |
+| RQ2 endpoints vs independent models | no | independent family (E07) |
+| RQ3 heterogeneity beyond static mixture | yes | — |
+| RQ4 can a controller read it | yes | — |
+| RQ5 systems realization | K/V only | serving benchmark (E08) |
+| RQ6 irreducible complementarity | no | independent family (E07) |
+| RQ7 request vs token level | no | gating diagnostic (E10) |
+
+H1, H2 and H3 have instruments. H4, H5 and H6 do not.
+
+### Next decision gate
+
+**Required evidence:** RQ1, RQ3 and RQ4 answered on FineWeb-Edu with the existing
+checkpoints, plus a frozen-adapter retrofit of `vr-noexits`.
+
+**Go condition:** at least two shallow endpoints on the frontier after full cost
+accounting, and a positive `probe-policy gain` whose clustered interval excludes
+zero.
+
+**Stop or pivot condition:** `probe-policy gain` near zero. Request-level routing
+then has no case, and E07/E08 should not be built for it.

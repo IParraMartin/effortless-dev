@@ -212,32 +212,38 @@ built it.
 
 ## Not established
 
+Nothing below is blocked on missing code any more, except where it says so.
+
 - **Nothing about sharing.** See *Retracted*. A causal estimate needs two arms
   from one serialized parent initialization under `anchored_v1`, with
-  `shallow_loss_weight` at 0 and at a nonzero value. The code for that exists;
-  the runs do not.
-- **No endpoint has been scored on real held-out text.**
-  `collect_depth_trajectories.collect()` still builds `mixed_difficulty_corpus`,
-  a synthetic pattern workload. It is a good mechanism test and it is not
-  evidence about language. A real-text collector is the next piece of work and
-  everything downstream waits on it.
+  `shallow_loss_weight` at 0 and at a nonzero value. **Runnable now.**
+- **No endpoint has been scored on real held-out text.** The collector can do it
+  (`--corpus real_text`) and the pipeline runs end to end, but it has not been
+  pointed at FineWeb-Edu with a real checkpoint. **Runnable now.**
 - **`probe-policy gain` is unmeasured on real text.** This is the go/no-go
   number. On the toy workload the outcome oracle showed +0.051 of headroom while
   the cross-fitted probe policy attained +0.008, so 85% of the apparent gain
-  required knowing the answer. Judging the controller against the outcome oracle
-  reports a near-optimal policy as a failure. Both figures are toy-workload
-  numbers.
-- **Sharing tax at shallow tiers.** `vr-noexits` gives one model, at depth 12.
-  Depths 2/4/6/8/10 have no independent counterpart, so they appear under
-  `sharing_tax_unmatched_tiers`. Measuring them needs an independent family.
+  required knowing the answer. Both figures are toy-workload numbers.
+  **Runnable now.**
+- **No retrofit has been trained.** `retrofit_parent.py` builds one and proves
+  the parent is preserved to the bit; nothing has trained its exits yet.
+  **Runnable now.**
+- **Sharing tax at shallow tiers.** Needs independently trained models at
+  matched cost. **Blocked on code** — no independent family and no adapter for
+  one (Pythia or similar). This is the single largest remaining gap, and it
+  blocks the paper's central claim.
+- **Latency, throughput, memory and energy on serving hardware.**
+  `benchmark_latency` measures TTFT and TPOT on a laptop toy model and the K/V
+  audit is exact. **Blocked on code** for continuous batching, depth-homogeneous
+  queues, SLO goodput, energy, and counter/profiler parity. TTFT also still comes
+  from a separate invocation rather than instrumented inside one.
+- **Whether token-level routing adds anything.** **Blocked on code**: the gating
+  diagnostic — token-level outcome-oracle gain beyond the request-level cap — is
+  not implemented, and by the roadmap nothing token-level should start until it
+  is.
 - **The K/V propagation strategy has never been trained.**
-  `learned_kv_propagation` defaults to `False` and neither run overrode it, so
-  the propagator was inert. It is the token-level approximation, and §7 notes it
-  materializes all `L` layers and therefore saves no memory. `experiments/exposure.py`
-  has the arms; it is gated behind request-level routing showing headroom.
-- **Latency on serving hardware.** `benchmark_latency` has only been run on a
-  toy model on a laptop. It establishes that the measurement is wired up, not
-  what routing is worth. No continuous batching, no tail latency, no energy.
+  `learned_kv_propagation` defaults to `False` and neither run overrode it.
+  Gated behind request-level routing showing headroom.
 - **Retrofit at scale.** The frozen modes preserve the parent bit-identically in
   tests on a tiny CPU model. The property is structural, so it should hold at
   scale, but it has not been run there.
@@ -259,34 +265,40 @@ built it.
 
 ## Next
 
-**Do not run `jobs/sharing_tax.sh` as it stands.** It points real checkpoints at
-`mixed_difficulty_corpus`, a synthetic token pattern, so its confidence intervals
-would be intervals about synthetic data. Real-text trajectory collection comes
-first.
+The pipeline runs end to end on real text. Verified on a fixture corpus:
+collection → controller → evaluation → no-regret test, with intervals resampling
+documents. What is missing is real data through it.
 
-Then, in order:
+```bash
+# 1. What is decodable from a final-only parent's intermediate states, at zero
+#    sharing cost. The parent's endpoint is preserved to the bit, so this is a
+#    clean measurement and needs no new training.
+python -m experiments.retrofit_parent \
+    --checkpoint checkpoints/vr-noexits/final.pt \
+    --run-dir runs/retrofit-adapter \
+    --mode frozen_exit_adapter --exit_adapter_rank 32 --exit_every 2
 
-1. **Re-score both checkpoints at every depth** on the same untouched held-out
-   requests, with the global reduction, writing per-document records. This is
-   what replaces the shard-level eval CEs above and gives depths 6, 8 and 10
-   their first held-out numbers.
-2. **Post-hoc readouts on the final-only parent.**
+# 2. Score every depth of both existing checkpoints on the same real held-out
+#    requests. This replaces the shard-level eval CEs above, and gives depths
+#    6, 8 and 10 their first held-out numbers.
+python -m experiments.collect_depth_trajectories \
+    --corpus real_text --data data/val.bin --eos_id 50256 \
+    --checkpoint checkpoints/vr-exits/final.pt \
+    --n_requests 4096 --out results/traj-exits
 
-   ```bash
-   python -m experiments.retrofit_parent \
-       --checkpoint checkpoints/vr-noexits/final.pt \
-       --run-dir runs/retrofit-adapter \
-       --mode frozen_exit_adapter --exit_adapter_rank 32 --exit_every 2
-   ```
+# 3. The go/no-go. Read probe-policy gain.
+python -m experiments.train_depth_controller --trajectories results/traj-exits \
+    --out results/controller --seeds 0 1 2
+python -m experiments.evaluate_vertical_routing --trajectories results/traj-exits \
+    --controller results/controller --controller_seed 0 --out results/evaluation
+```
 
-   The parent's full-depth output is preserved to the bit, so this measures what
-   is decodable from a final-only model's intermediate states with no sharing
-   cost of any kind. If its shallow endpoints match the six-exit model's, sharing
-   was never the binding constraint.
-3. **Common-parent anchored arms**, `--objective_version=anchored_v1` with
-   `--shallow_loss_weight` swept. This is the sharing measurement the first pair
-   could not be.
-4. Only then the controller, and only reading `probe-policy gain`.
+`--eos_id 50256` is GPT-2's end-of-text token. Omitting it makes every interval
+unclustered and too narrow, and the corpus metadata will say so.
+
+If `probe-policy gain` is near zero on real text, request-level routing has no
+case and no amount of controller work will create one. That is the result worth
+having early, and it now costs one job rather than a rewrite.
 
 ---
 
@@ -309,5 +321,5 @@ python -m experiments.benchmark_latency --out results/latency --device=cpu
 python -c "from src.config import TransformerConfig as C; \
   print([round(w,6) for w in C(n_layers=12, exit_every=2).exit_weights])"
 
-python -m unittest discover -s tests -t .   # 358 tests
+python -m unittest discover -s tests -t .   # 414 tests
 ```
