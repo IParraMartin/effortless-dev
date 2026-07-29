@@ -265,40 +265,29 @@ Nothing below is blocked on missing code any more, except where it says so.
 
 ## Next
 
-The pipeline runs end to end on real text. Verified on a fixture corpus:
-collection → controller → evaluation → no-regret test, with intervals resampling
-documents. What is missing is real data through it.
+**See `START_HERE.md`.** The plan was cut from twelve experiments to three on
+2026-07-29; that file holds the three commands in order with their kill
+conditions.
+
+The immediate one costs nothing and uses the checkpoint already on disk:
 
 ```bash
-# 1. What is decodable from a final-only parent's intermediate states, at zero
-#    sharing cost. The parent's endpoint is preserved to the bit, so this is a
-#    clean measurement and needs no new training.
 python -m experiments.retrofit_parent \
     --checkpoint checkpoints/vr-noexits/final.pt \
     --run-dir runs/retrofit-adapter \
     --mode frozen_exit_adapter --exit_adapter_rank 32 --exit_every 2
-
-# 2. Score every depth of both existing checkpoints on the same real held-out
-#    requests. This replaces the shard-level eval CEs above, and gives depths
-#    6, 8 and 10 their first held-out numbers.
-python -m experiments.collect_depth_trajectories \
-    --corpus real_text --data data/val.bin --eos_id 50256 \
-    --checkpoint checkpoints/vr-exits/final.pt \
-    --n_requests 4096 --out results/traj-exits
-
-# 3. The go/no-go. Read probe-policy gain.
-python -m experiments.train_depth_controller --trajectories results/traj-exits \
-    --out results/controller --seeds 0 1 2
-python -m experiments.evaluate_vertical_routing --trajectories results/traj-exits \
-    --controller results/controller --controller_seed 0 --out results/evaluation
 ```
 
-`--eos_id 50256` is GPT-2's end-of-text token. Omitting it makes every interval
-unclustered and too narrow, and the corpus metadata will say so.
+The parent's logits come back bit-identical, which is the no-regret claim
+verified rather than argued. Training the exits it creates touches no backbone
+weight. What that measures is whether a final-only model's intermediate states are
+decodable at all — and if they are, the sharing question that these two runs were
+built to answer stops mattering, because a frozen parent pays no sharing tax.
 
-If `probe-policy gain` is near zero on real text, request-level routing has no
-case and no amount of controller work will create one. That is the result worth
-having early, and it now costs one job rather than a rewrite.
+The four Pile + NeoX scratch arms are **cut**, along with the serving benchmark,
+token-level routing and RL. `DESCRIPTION.md` records each reason. The job scripts
+for the Pile arms remain written and validated in case the retrofit's tiers turn
+out too weak to use.
 
 ---
 

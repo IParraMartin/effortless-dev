@@ -1,8 +1,12 @@
 # 2026-07-29
 
 This is the research diary: objective, hypotheses, experiment registry, and a
-dated decision log. `CURRENT.md` holds the state of the runs; `MIGRATIONS.md`
+dated decision log. **`START_HERE.md` is the plan** — read that first if you want
+to know what to run. `CURRENT.md` holds the state of the runs; `MIGRATIONS.md`
 holds schema and default changes. The newest decision-log entry is at the bottom.
+
+The registry below was cut from twelve experiments to three on 2026-07-29. The
+cut entries are retained with their reasons rather than deleted.
 
 ## Project identity
 
@@ -181,20 +185,41 @@ Token-level depth adaptation and learned K/V propagation remain a later extensio
 
 ## Active experiment registry
 
-| ID | Experiment | Status | Success criterion |
-|---|---|---|---|
-| E00 | Apply critical correctness patch | Ready | Clean apply; all tests pass; routed block execution equals counters. |
-| E01 | Re-score existing checkpoints on real held-out data | Blocked on checkpoints | Every depth, same documents, global DDP reduction, per-document records. |
-| E02 | Post-hoc readouts on final-only checkpoint | Planned | Determines whether depth saturation exists without joint exit training. |
-| E03 | Common-parent frozen-exit retrofit | Planned | Useful shallow tiers with exactly unchanged parent output. |
-| E04 | Anchored objective sweep | Planned | Improves shallow endpoints while meeting full-depth non-inferiority. |
-| E05 | Selective unfreeze / LoRA retrofit | Planned | Beats frozen exits at equal adaptation cost without parent regression. |
-| E06 | Real-text trajectory and controller study | Planned | Cross-fitted router beats exact static mixture on untouched requests. |
-| E07 | Independent horizontal family | Planned | Cost-matched vertical substitution ratio with confidence bands. |
-| E08 | Serving benchmark | Planned | Measured TTFT/TPOT/throughput/KV/energy frontier on identical hardware. |
-| E09 | Distribution shift and safety | Planned | Controller remains calibrated or safely escalates under shift. |
-| E10 | Token-level routing and K/V propagation | Gated | Only proceed if request routing has residual learnable headroom. |
-| E11 | RL or constrained bandit controller | Gated | Only proceed if supervised controller leaves reward-specific headroom. |
+Cut to three on 2026-07-29. Each remaining experiment tests one claim, and each
+can kill the next — which is why they run in order.
+
+| ID | Experiment | Claim | Status | Kill condition |
+|---|---|---|---|---|
+| **A1** | Frozen retrofit of the final-only checkpoint, exits trained | no regret; useful tiers | Ready, no cluster cost | Shallow tiers no better than chance: the parent's intermediate states carry nothing and the method has no basis |
+| **A2** | Real-text trajectories, controller, evaluation | learnable adaptivity | Ready | `probe-policy gain` at zero: requests do not differ in required depth |
+| **A3** | Pythia 70m/160m/410m at `step1000` | substitution | Ready, one GPU job | Frontier too compressed to divide by: report the tax, not a ratio |
+
+### Cut, with reasons
+
+Retained so the history is legible and so a later reader knows these were
+decisions rather than oversights.
+
+| Former ID | Experiment | Why cut |
+|---|---|---|
+| E00 | Apply the critical-fixes patch | **Completed** 2026-07-29 (`5a8f3fb`), not cut |
+| E01 | Re-score both existing checkpoints at every depth | Folded into A2, which scores endpoints on real held-out requests anyway |
+| E02, E03 | Post-hoc readouts; frozen-exit retrofit | Merged into **A1** |
+| E04, E05 | Anchored-objective sweep; selective unfreeze / LoRA | Cut. Both are *method* comparisons within the retrofit ladder. The paper needs one working rung, not a ladder survey. The machinery stays available. |
+| E06 | Trajectory and controller study | Became **A2** |
+| E07 | Independent horizontal family | Became **A3**, reduced from five Pythia tiers to three: 1b and 1.4b sit far past the backbone's capacity and do not inform substitution |
+| — | Four Pile + NeoX scratch arms (64 GPU-hours), approved earlier the same day | **Cut.** They measure the cost of multi-exit *pre-training*, which is not the proposed method: a frozen parent pays no sharing tax by construction. Returns only if A1 shows frozen tiers are unusable, in which case trained exits become necessary and sharing becomes a real cost. |
+| E08 | Serving benchmark | Cut. A second paper's worth of work. K/V memory is verified exactly; latency, throughput, goodput and energy are reported as unmeasured rather than estimated. |
+| E09 | Distribution shift and safety by endpoint | Cut. Separate contribution. |
+| E10 | Token-level routing, learned K/V propagation | Cut to future work. Its gating diagnostic was not built either, so the branch is closed rather than pending. |
+| E11 | RL or contextual bandit controller | Cut to future work. Never justified before a supervised controller works. |
+
+### What the cut costs
+
+Conditions 6 through 10 of the brief's definition of done are not met and are not
+being pursued: no serving benchmark, no energy, no continuous batching, no
+token-level analysis, no multi-seed scratch comparison. The paper is smaller. It
+is complete at that size — three claims, three experiments, each failure
+informative — rather than eleven half-built ones.
 
 ## Claim discipline
 
@@ -583,3 +608,83 @@ zero.
 
 **Stop or pivot condition:** `probe-policy gain` near zero. Request-level routing
 then has no case, and E07/E08 should not be built for it.
+
+---
+
+## Decision log — 2026-07-29 (scope cut)
+
+Fourth entry for the date. The previous three added capability; this one removes
+scope. Nothing was deleted from the record — the cut experiments are listed above
+with their reasons.
+
+### Why
+
+The project had accumulated twelve experiments, four documents, two training
+objectives, three distinct meanings of "K/V cache", and a 64-GPU-hour cluster plan
+approved earlier the same day. None of it was wrong and none of it was navigable.
+The registry had become a list of things that could be done rather than a plan.
+
+Volume was the failure. Eleven half-built experiments support no claim; three
+complete ones support three.
+
+### Research questions, narrowed
+
+Of the seven questions in this file, three are retained as claims the paper makes:
+no-regret endpoints, useful tiers, and partial substitution against a matched
+family. RQ5 (systems realization) is answered only for K/V memory and reported as
+unmeasured elsewhere. RQ7 (token versus request level) is closed to future work.
+RQ6 (irreducible complementarity) needs heterogeneous specialists rather than one
+same-family suite, and is out of scope.
+
+Hypotheses H1, H2 and H3 have instruments and experiments. H4 has an instrument
+and an experiment but may be unreportable if the matched frontier is too narrow to
+divide by. H5 and H6 are dropped.
+
+### The load-bearing argument for the largest cut
+
+The four Pile + NeoX scratch arms were approved, scripted, and then cut within the
+same day. The argument that removed them:
+
+> The sharing tax is not a claim in the thesis. The thesis is *retrofit a trained
+> parent*. If the parent is frozen, no sharing tax exists — that is the content of
+> the no-regret framing. Measuring the tax would price a method the project is not
+> proposing.
+
+The contingency is explicit rather than hopeful: a frozen retrofit gives only what
+is linearly decodable from the parent's intermediate states, which may be too
+weak. A1 measures exactly that, for free, before any cluster time is spent. If A1
+fails, trained exits become necessary, sharing becomes a real cost, and the Pile
+arms return — with `jobs/controlled_arms.sh` and `jobs/prepare_pile.sh` already
+written and validated.
+
+### Code changed
+
+None. This entry is scope and documentation only. Every cut experiment's machinery
+remains in the repository and tested: the anchored objective, the full retrofit
+ladder including LoRA, the controlled-arm job scripts, and the Pile preparation
+script are all present and green. Cutting an experiment did not mean deleting the
+means to run it.
+
+### Added
+
+`START_HERE.md`. One question, three commands in order, each with its kill
+condition, plus the four things most likely to confuse a later reader: the three
+meanings of "K/V cache", the two objectives and which to use, the retraction of
+the two runs on disk, and why cross-tokenizer quality must be bits per byte.
+
+The gap it fills is that `DESCRIPTION.md`, `CURRENT.md` and `MIGRATIONS.md` are
+all *records*. None of them said what to run.
+
+### Next decision gate
+
+**Required evidence:** A1 — a frozen retrofit of `vr-noexits/final.pt` with its
+exits trained, endpoints scored on real held-out text.
+
+**Go condition:** at least two shallow endpoints on the quality–cost frontier
+after full cost accounting, with the parent's logits bit-identical.
+
+**Stop or pivot condition:** shallow endpoints no better than the deepest one is
+worth using, or no better than chance. The first means routing has nothing to
+choose between; the second means the parent's intermediate states are not
+decodable and the retrofit framing fails. Either sends the project back to trained
+exits and reinstates the Pile arms.
