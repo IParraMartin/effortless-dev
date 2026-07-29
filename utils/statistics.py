@@ -47,6 +47,13 @@ class Interval:
         high: Upper confidence bound.
         level: Coverage, for example ``0.95``.
         resamples: Bootstrap replicates behind the bounds.
+        clustered: Whether whole clusters were resampled rather than individual
+            observations. Recorded because the same interval means different
+            things in the two cases, and an unclustered interval over correlated
+            observations is too narrow.
+        n_clusters: Number of resampling units, when clustered. This is the
+            effective sample size the interval rests on, and it can be far below
+            the number of observations.
     """
 
     estimate: float
@@ -54,9 +61,14 @@ class Interval:
     high: float
     level: float = 0.95
     resamples: int = DEFAULT_RESAMPLES
+    clustered: bool = False
+    n_clusters: int | None = None
 
     def __str__(self) -> str:
-        return f"{self.estimate:+.4f} [{self.low:+.4f}, {self.high:+.4f}]"
+        unit = f" ({self.n_clusters} clusters)" if self.clustered else ""
+        return (
+            f"{self.estimate:+.4f} [{self.low:+.4f}, {self.high:+.4f}]{unit}"
+        )
 
     def excludes(self, value: float) -> bool:
         """Whether the interval lies entirely on one side of a value.
@@ -76,6 +88,7 @@ def paired_bootstrap(
     level: float = 0.95,
     resamples: int = DEFAULT_RESAMPLES,
     seed: int = 0,
+    clusters: Sequence[int] | np.ndarray | None = None,
 ) -> Interval:
     """Bootstraps a statistic over per-request observations.
 
@@ -87,18 +100,55 @@ def paired_bootstrap(
         level: Coverage of the interval.
         resamples: Number of replicates.
         seed: Random seed, recorded so an interval is reproducible.
+        clusters: Group label per observation, normally the document a request
+            was cut from. When given, whole clusters are resampled with
+            replacement instead of individual observations.
+
+            This is not a refinement. Requests from one document are correlated,
+            and resampling them independently treats each as fresh evidence,
+            which makes the interval too narrow — so a predeclared
+            non-inferiority test can *pass* on correlation rather than on
+            effect. Leaving this ``None`` is only correct when each observation
+            is its own cluster.
 
     Returns:
-        The estimate and its percentile interval.
+        The estimate and its percentile interval. ``clustered`` records which
+        resampling unit was used, so a reader can tell.
 
     Raises:
-        ValueError: If ``values`` is empty.
+        ValueError: If ``values`` is empty, or if ``clusters`` has a different
+            length.
     """
     data = np.asarray(values, dtype=float)
     if data.size == 0:
         raise ValueError("values must not be empty.")
 
     rng = np.random.default_rng(seed)
+
+    if clusters is not None:
+        labels = np.asarray(clusters)
+        if labels.shape[0] != data.size:
+            raise ValueError(
+                f"clusters has {labels.shape[0]} labels for {data.size} "
+                f"observations; every observation needs exactly one."
+            )
+        groups = [np.flatnonzero(labels == label) for label in np.unique(labels)]
+        replicates = np.empty(resamples)
+        for replicate in range(resamples):
+            chosen = rng.integers(0, len(groups), size=len(groups))
+            drawn = np.concatenate([groups[index] for index in chosen])
+            replicates[replicate] = statistic(data[drawn])
+        tail = (1.0 - level) / 2.0
+        return Interval(
+            estimate=float(statistic(data)),
+            low=float(np.quantile(replicates, tail)),
+            high=float(np.quantile(replicates, 1.0 - tail)),
+            level=level,
+            resamples=resamples,
+            clustered=True,
+            n_clusters=len(groups),
+        )
+
     indices = rng.integers(0, data.size, size=(resamples, data.size))
     replicates = np.array([statistic(data[row]) for row in indices])
 
@@ -506,6 +556,7 @@ def non_inferiority_test(
     level: float = 0.95,
     resamples: int = DEFAULT_RESAMPLES,
     seed: int = 0,
+    clusters: Sequence[int] | np.ndarray | None = None,
 ) -> NonInferiorityResult:
     """Tests whether one system can stand in for another at matched cost.
 
@@ -531,6 +582,9 @@ def non_inferiority_test(
         level: Coverage of the intervals.
         resamples: Bootstrap replicates.
         seed: Random seed.
+        clusters: Resampling unit, normally the document id. Omitting it treats
+            every request as independent evidence and narrows both intervals,
+            which for a one-sided non-inferiority test biases toward passing.
 
     Returns:
         The populated :class:`NonInferiorityResult`.
@@ -560,10 +614,12 @@ def non_inferiority_test(
     )
 
     quality_interval = paired_bootstrap(
-        quality_delta, level=level, resamples=resamples, seed=seed
+        quality_delta, level=level, resamples=resamples, seed=seed,
+        clusters=clusters,
     )
     cost_interval = paired_bootstrap(
-        cost_delta, level=level, resamples=resamples, seed=seed + 1
+        cost_delta, level=level, resamples=resamples, seed=seed + 1,
+        clusters=clusters,
     )
 
     return NonInferiorityResult(

@@ -283,6 +283,14 @@ class DepthController(nn.Module):
             d_model, pooling, include_length
         )
 
+        # The cost metric this controller was *selected* under. Offline
+        # selection subtracts a stored per-request cost vector; the live path is
+        # handed one by the caller. If the two are different quantities the
+        # controller optimizes an objective nobody validated, and the mismatch
+        # leaves no trace in any output. Set by the loader from the checkpoint,
+        # and enforced by :meth:`select`.
+        self.cost_metric: str | None = None
+
         # Probe features are raw residual-stream statistics whose scale depends
         # on the probe layer and the model, so they are normalized before the
         # trunk rather than left for the trunk to absorb.
@@ -414,6 +422,17 @@ class DepthController(nn.Module):
 
         if self.output == "utility":
             if tier_costs is None:
+                if self.cost_metric not in (None, "cost_depth_fraction"):
+                    raise ValueError(
+                        f"this controller was selected under cost metric "
+                        f"{self.cost_metric!r}, but select() was called without "
+                        f"tier_costs and would fall back to depth/max_depth. "
+                        f"Those are different objectives: a controller validated "
+                        f"against measured MACs or cache bytes and deployed "
+                        f"against a depth fraction is optimizing something "
+                        f"nobody evaluated. Build the cost vector from the "
+                        f"request's shape and pass it."
+                    )
                 tier_costs = tier_tensor.to(scores.dtype) / max(tiers)
             utility = scores - routing_lambda * tier_costs.view(1, -1).to(
                 scores.device

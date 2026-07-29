@@ -170,6 +170,40 @@ class AnalyticalCostModel:
         """
         return 2.0 * self.d_model * rank
 
+    def exit_adapter_macs(self, rank: int) -> float:
+        """Cost of one exit adapter for one token.
+
+        A retrofit that adds these and does not charge for them reports a
+        frontier its endpoints do not sit on. The amount is small — at
+        ``d_model=768`` a rank-32 adapter is 49,152 MACs against a block's 8.7M,
+        so about 0.57% of a block — but it lands entirely on the cheap end of the
+        frontier, which is where the shallow endpoints being justified live.
+
+        Args:
+            rank: Bottleneck width.
+
+        Returns:
+            The down and up projections. One adapter runs per readout, not per
+            block, so this is charged alongside :attr:`head_macs`.
+        """
+        return 2.0 * self.d_model * rank
+
+    def lora_macs(self, rank: int, targets_per_block: int) -> float:
+        """Cost of the low-rank updates inside one block, for one token.
+
+        Args:
+            rank: Rank of each update.
+            targets_per_block: Wrapped projections in the block.
+
+        Returns:
+            Estimated multiply-accumulates. Each update is a ``d_model x rank``
+            down-projection followed by a ``rank x d_model`` up-projection, so it
+            scales with rank and with how many projections were wrapped. Unlike
+            the exit adapter this is charged *per executed block*, so it grows
+            with the routed depth.
+        """
+        return targets_per_block * 2.0 * self.d_model * rank
+
     def prefill_macs(self, depth: int, prompt_len: int) -> float:
         """Cost of running a prompt through the first ``depth`` blocks.
 

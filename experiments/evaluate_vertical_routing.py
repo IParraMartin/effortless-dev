@@ -162,6 +162,30 @@ class SystemResult:
         return self.mean_cost, self.mean_quality
 
 
+def request_clusters(records: list[dict]) -> np.ndarray | None:
+    """Resolves the unit every interval should be resampled over.
+
+    Args:
+        records: Trajectory records for the rows being evaluated.
+
+    Returns:
+        One cluster label per record — the document each request was cut from —
+        or ``None`` when the records predate schema 2 and carry no document
+        identity.
+
+        ``None`` is returned rather than silently substituting ``request_id``,
+        because those two produce different intervals and the caller has to be
+        able to say which it got. Falling back quietly would report an
+        unclustered interval under a clustered label.
+    """
+    if not records:
+        return None
+    labels = [record.get("document_id", -1) for record in records]
+    if any(label is None or label < 0 for label in labels):
+        return None
+    return np.asarray(labels)
+
+
 def load_controller(path: str | Path) -> tuple[DepthController, dict]:
     """Restores a controller saved by the trainer.
 
@@ -189,6 +213,12 @@ def load_controller(path: str | Path) -> tuple[DepthController, dict]:
         input_dim=blob["feature_dim"],
     )
     controller.load_state_dict(blob["state_dict"])
+    # Stamp the cost metric the controller was selected under, so a later
+    # select() without a cost vector fails instead of silently substituting a
+    # depth fraction for whatever this was validated against.
+    controller.cost_metric = (
+        blob.get("train_config", {}) or {}
+    ).get("cost_metric")
     controller.eval()
     return controller, blob
 
@@ -659,6 +689,7 @@ def estimands(
     tiers: list[int],
     config: EvaluationConfig,
     horizontal_tiers: list[int] | None = None,
+    clusters: np.ndarray | None = None,
 ) -> dict:
     """Computes the estimands the paper's claims rest on.
 
@@ -763,6 +794,7 @@ def estimands(
                     router.quality - mixture.quality,
                     resamples=config.resamples,
                     seed=config.seed,
+                    clusters=clusters,
                 )
                 entry["vs_static_mixture"] = asdict(margin)
                 entry["beats_static_mixture"] = bool(margin.low > 0.0)
@@ -787,7 +819,8 @@ def estimands(
                 horizontal_quality[:, column] - vertical_quality[:, index]
             )
             interval = paired_bootstrap(
-                difference, resamples=config.resamples, seed=config.seed
+                difference, resamples=config.resamples, seed=config.seed,
+                clusters=clusters,
             )
             taxes.append(
                 {
@@ -972,10 +1005,24 @@ def evaluate(config: EvaluationConfig) -> dict:
         )
         systems += extra
 
+    clusters = request_clusters(subset)
     numbers = estimands(
         systems, quality, cost, horizontal_quality, horizontal_cost,
-        tiers, config, horizontal_tiers,
+        tiers, config, horizontal_tiers, clusters=clusters,
     )
+    numbers["resampling_unit"] = {
+        "field": "document_id" if clusters is not None else "request",
+        "n_clusters": None if clusters is None else int(len(set(clusters.tolist()))),
+        "n_requests": len(subset),
+        "note": (
+            "intervals resample documents; requests from one document are not "
+            "independent evidence"
+            if clusters is not None
+            else "records carry no document_id (schema 1), so every request is "
+            "treated as its own cluster and every interval below is narrower "
+            "than it should be"
+        ),
+    }
 
     substitution = None
     if horizontal_quality is not None and controller is not None:
@@ -994,6 +1041,7 @@ def evaluate(config: EvaluationConfig) -> dict:
             cost_tolerance=config.cost_tolerance,
             resamples=config.resamples,
             seed=config.seed,
+            clusters=clusters,
         )
         result.vsr_target = config.vsr_target
 

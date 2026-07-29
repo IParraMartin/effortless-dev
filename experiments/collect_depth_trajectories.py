@@ -54,6 +54,8 @@ from src.config import RoutingConfig, TransformerConfig
 from src.model import Transformer
 from src.routing import pool_prompt_features
 from experiments.workloads import (
+    RequestShape,
+    real_text_corpus,
     Workload,
     mixed_difficulty_corpus,
     split_by_source,
@@ -63,7 +65,115 @@ from utils.costs import AnalyticalCostModel
 from utils.provenance import RunRecord, file_digest
 
 #: Version of the trajectory record layout. Bump when a field changes meaning.
-SCHEMA_VERSION = 1
+#:
+#: Version 2 adds document identity, per-request NLL *sums* alongside the means,
+#: and the corpus the requests came from. The sums are what make a corpus-level
+#: number correct: requests differ in length, so a mean of per-request means is
+#: not the corpus NLL, and the difference grows with the spread of lengths.
+SCHEMA_VERSION = 2
+
+#: Corpora the collector can draw from.
+#:
+#: ``synthetic`` is ``mixed_difficulty_corpus``: a mechanism test whose depth
+#: structure is a rule the experimenter installed. It answers "does the machinery
+#: work", never "do real prompts vary in the depth they need".
+#:
+#: ``real_text`` draws from a tokenized corpus written by ``training.data``. This
+#: is the only setting whose output belongs in a paper.
+CORPORA = ("synthetic", "real_text")
+
+
+def parse_shapes(shapes: tuple[str, ...]) -> tuple[RequestShape, ...]:
+    """Parses ``"prompt:continuation"`` shape specifications.
+
+    Args:
+        shapes: Strings such as ``("64:32", "256:128")``.
+
+    Returns:
+        The parsed shapes, in the order given.
+
+    Raises:
+        ValueError: If a specification is malformed or non-positive. A shape that
+            silently parsed to zero would produce requests with no continuation
+            and an NLL over nothing.
+    """
+    parsed = []
+    for shape in shapes:
+        try:
+            prompt, continuation = (int(part) for part in str(shape).split(":"))
+        except ValueError as error:
+            raise ValueError(
+                f"shape {shape!r} must look like 'prompt:continuation', "
+                f"for example '128:64'."
+            ) from error
+        if prompt < 1 or continuation < 1:
+            raise ValueError(
+                f"shape {shape!r} must have positive lengths, got "
+                f"prompt={prompt}, continuation={continuation}."
+            )
+        parsed.append(RequestShape(prompt, continuation))
+    if not parsed:
+        raise ValueError("at least one shape is required.")
+    return tuple(parsed)
+
+
+def check_corpus_compatible(
+    model_config: TransformerConfig,
+    splits: list[tuple[str, Workload]],
+    corpus_metadata: dict,
+) -> None:
+    """Rejects a corpus the model cannot score, before any scoring happens.
+
+    Both checks below were found by running the collector rather than by reading
+    it, and both used to surface as a stack trace from inside the embedding or
+    the length guard — after minutes of work on the shapes that happened to fit.
+    A collection that dies partway through leaves shards a resume will treat as
+    complete, so these are startup errors by design.
+
+    Args:
+        model_config: Architecture that will do the scoring.
+        splits: The workloads about to be scored.
+        corpus_metadata: Corpus description, which carries the tokenizer size.
+
+    Raises:
+        ValueError: If a request is longer than the model's context, or if the
+            corpus was tokenized with a vocabulary the model does not cover.
+    """
+    too_long = sorted(
+        {
+            (subset.prompt_len, subset.continuation_len)
+            for _, subset in splits
+            if len(subset)
+            and subset.prompt_len + subset.continuation_len > model_config.max_seq_len
+        }
+    )
+    if too_long:
+        raise ValueError(
+            f"request shape(s) {too_long} exceed the model's context of "
+            f"{model_config.max_seq_len} tokens. Teacher forcing scores the "
+            f"prompt and the continuation in one sequence, so the shape's *total* "
+            f"must fit. Drop the long shapes from --shapes."
+        )
+
+    tokenizer_size = corpus_metadata.get("tokenizer_size")
+    if tokenizer_size is not None and tokenizer_size > model_config.vocab_size:
+        raise ValueError(
+            f"the corpus was tokenized with a vocabulary of {tokenizer_size} but "
+            f"the model covers {model_config.vocab_size}. Scoring it would index "
+            f"past the embedding on any token above {model_config.vocab_size - 1}, "
+            f"and a corpus that happened to contain none would score fine and be "
+            f"the wrong corpus."
+        )
+
+    highest = max(
+        (int(subset.sequences().max()) for _, subset in splits if len(subset)),
+        default=-1,
+    )
+    if highest >= model_config.vocab_size:
+        raise ValueError(
+            f"the drawn requests contain token id {highest}, outside the model's "
+            f"vocabulary of {model_config.vocab_size}."
+        )
 
 
 @dataclass
@@ -102,6 +212,10 @@ class TrajectoryConfig:
     seed: int = 0
     backbone_steps: int = 900
     resample: bool = True
+    corpus: str = "synthetic"
+    data: str = "data/val.bin"
+    eos_id: int | None = None
+    shapes: tuple[str, ...] = ("64:32", "128:64", "256:128")
 
 
 @dataclass
@@ -131,6 +245,19 @@ class RequestRecord:
         cost_depth_fraction: Tier divided by full depth, a cost measure with no
             hardware assumptions in it at all.
         kv_bytes: Cache bytes per tier.
+        teacher_forced_nll_sum: Total NLL over scored positions, per tier. Sum
+            these and ``valid_tokens`` separately to get a corpus NLL; averaging
+            ``teacher_forced_nll`` across requests of different lengths does not.
+        teacher_forced_top1_count: Correct top-1 predictions per tier.
+        valid_tokens: Positions that contributed, the denominator for both.
+        document_id: Document the request was cut from. Requests sharing one are
+            not independent observations, so this is the clustered bootstrap's
+            resampling unit.
+        domain: Source label, for distribution-shift analysis.
+        token_hash: Digest of the request's tokens, so the record identifies
+            content rather than an offset that a re-tokenization would move.
+        corpus_offset: Where the request began in the token file.
+        shape: Request shape label, e.g. ``"p128c64"``.
     """
 
     request_id: int
@@ -143,6 +270,18 @@ class RequestRecord:
     teacher_forced_nll: list[float]
     teacher_forced_accuracy: list[float]
     teacher_forced_top1_agreement: list[float]
+    # Schema 2. Sums and counts, so a corpus number can be formed correctly by
+    # summing numerators and denominators separately.
+    teacher_forced_nll_sum: list[float] = field(default_factory=list)
+    teacher_forced_top1_count: list[int] = field(default_factory=list)
+    valid_tokens: int = 0
+    # Schema 2. Identity, so a record names the bytes it scored and the document
+    # a clustered bootstrap should resample.
+    document_id: int = -1
+    domain: str = "unknown"
+    token_hash: str = ""
+    corpus_offset: int = -1
+    shape: str = ""
     free_running_reward: list[float] = field(default_factory=list)
     free_running_agreement: list[float] = field(default_factory=list)
     final_nll: float = 0.0
@@ -170,14 +309,18 @@ def teacher_forced_labels(
         tiers: Candidate depths.
 
     Returns:
-        Arrays shaped ``(n_requests, n_tiers)`` for ``nll``, ``accuracy``, and
-        ``top1_agreement``.
+        Arrays shaped ``(n_requests, n_tiers)`` for ``nll``, ``accuracy``,
+        ``top1_agreement``, ``nll_sum`` and ``top1_count``, plus a scalar
+        ``valid_tokens``. The sums are returned alongside the means because a
+        corpus NLL is a ratio of totals: averaging per-request means weights a
+        32-token request the same as a 128-token one.
     """
     sequences = workload.sequences()
     inputs, targets = sequences[:, :-1], sequences[:, 1:]
     start = workload.prompt_len - 1
 
     nll, accuracy, predictions = [], [], []
+    nll_sum, top1_count = [], []
     for depth in tiers:
         state = model.forward_to_depth(inputs, depth)
         logits = model.endpoint_logits(state.hidden, depth)[:, start:]
@@ -190,8 +333,11 @@ def teacher_forced_labels(
         ).view_as(gold)
 
         nll.append(per_token.mean(dim=1))
+        nll_sum.append(per_token.sum(dim=1))
         greedy = logits.argmax(dim=-1)
-        accuracy.append((greedy == gold).float().mean(dim=1))
+        correct = (greedy == gold).float()
+        accuracy.append(correct.mean(dim=1))
+        top1_count.append(correct.sum(dim=1))
         predictions.append(greedy)
 
     deepest = predictions[-1]
@@ -203,6 +349,9 @@ def teacher_forced_labels(
         "nll": torch.stack(nll, dim=1).numpy(),
         "accuracy": torch.stack(accuracy, dim=1).numpy(),
         "top1_agreement": torch.stack(agreement, dim=1).numpy(),
+        "nll_sum": torch.stack(nll_sum, dim=1).numpy(),
+        "top1_count": torch.stack(top1_count, dim=1).numpy(),
+        "valid_tokens": int(gold.size(1)),
     }
 
 
@@ -298,15 +447,21 @@ def tier_costs(
     prompt_len: int,
     generated: int,
     cache_dtype: str = "bf16",
+    lora_rank: int = 0,
+    lora_targets_per_block: int = 0,
 ) -> dict[str, np.ndarray]:
     """Computes what each tier costs for one request shape.
 
     Args:
-        config: Model architecture.
+        config: Model architecture. ``exit_adapter_rank`` is read from it and
+            charged once per generated token, alongside the vocabulary head.
         tiers: Candidate depths.
         prompt_len: Prompt length.
         generated: Tokens generated.
         cache_dtype: Precision assumed for cache bytes.
+        lora_rank: Rank of any low-rank updates wrapped onto the backbone.
+            Charged per executed block, so it grows with the routed depth.
+        lora_targets_per_block: How many projections per block carry an update.
 
     Returns:
         Arrays over tiers for ``macs``, ``depth_fraction``, and ``kv_bytes``.
@@ -332,6 +487,13 @@ def tier_costs(
         # One vocabulary projection per generated token, which is the whole
         # point of reading out only at the endpoint.
         total += generated * cost.head_macs
+        # Retrofit modules are part of the endpoint, so they are part of its
+        # cost. Omitting them reports a frontier the endpoints do not sit on.
+        if config.exit_adapter_rank:
+            total += generated * cost.exit_adapter_macs(config.exit_adapter_rank)
+        if lora_rank and lora_targets_per_block:
+            per_block = cost.lora_macs(lora_rank, lora_targets_per_block)
+            total += depth * (prompt_len + generated) * per_block
         macs.append(total)
         # One position short of prompt + generated: the last token emitted is
         # never fed back, so nothing ever attends to it and its keys and values
@@ -362,12 +524,47 @@ def collect(config: TrajectoryConfig) -> tuple[list[RequestRecord], np.ndarray, 
     """
     torch.manual_seed(config.seed)
 
-    workload = mixed_difficulty_corpus(
-        n_requests=config.n_requests, seed=config.seed
-    )
-    train, validation = split_by_source(
-        workload, config.validation_fraction, seed=config.seed
-    )
+    if config.corpus not in CORPORA:
+        raise ValueError(
+            f"corpus must be one of {CORPORA}, got {config.corpus!r}."
+        )
+
+    corpus_metadata: dict
+    if config.corpus == "real_text":
+        # One workload per request shape, so no batch ever contains padding and
+        # each shape's cost is exact rather than averaged.
+        buckets, corpus_metadata = real_text_corpus(
+            config.data,
+            shapes=parse_shapes(config.shapes),
+            n_requests=config.n_requests,
+            eos_id=config.eos_id,
+            seed=config.seed,
+        )
+        splits = []
+        for bucket in buckets:
+            train_part, validation_part = split_by_source(
+                bucket, config.validation_fraction, seed=config.seed
+            )
+            splits.append(("train", train_part))
+            splits.append(("validation", validation_part))
+    else:
+        workload = mixed_difficulty_corpus(
+            n_requests=config.n_requests, seed=config.seed
+        )
+        train, validation = split_by_source(
+            workload, config.validation_fraction, seed=config.seed
+        )
+        splits = [("train", train), ("validation", validation)]
+        corpus_metadata = {
+            "corpus": "synthetic",
+            "warning": (
+                "mixed_difficulty_corpus is a mechanism test. Its depth "
+                "structure is a rule installed by the experimenter, so a result "
+                "on it says whether the machinery works, not whether real "
+                "prompts vary in the depth they need. Do not report it as "
+                "evidence about language."
+            ),
+        }
 
     if config.checkpoint is None:
         print("training the demonstration backbone ...")
@@ -415,8 +612,15 @@ def collect(config: TrajectoryConfig) -> tuple[list[RequestRecord], np.ndarray, 
     records: list[RequestRecord] = []
     feature_blocks: list[np.ndarray] = []
 
-    for split_name, subset in (("train", train), ("validation", validation)):
-        print(f"scoring {len(subset)} {split_name} requests at depths {tiers} ...")
+    check_corpus_compatible(model.config, splits, corpus_metadata)
+
+    for split_name, subset in splits:
+        if not len(subset):
+            continue
+        print(
+            f"scoring {len(subset)} {split_name} requests "
+            f"({subset.prompt_len}+{subset.continuation_len}) at depths {tiers} ..."
+        )
 
         teacher = teacher_forced_labels(model, subset, tiers)
         features = probe_features(
@@ -467,6 +671,30 @@ def collect(config: TrajectoryConfig) -> tuple[list[RequestRecord], np.ndarray, 
                     cost_macs=costs["macs"].tolist(),
                     cost_depth_fraction=costs["depth_fraction"].tolist(),
                     kv_bytes=costs["kv_bytes"].tolist(),
+                    teacher_forced_nll_sum=teacher["nll_sum"][row].tolist(),
+                    teacher_forced_top1_count=[
+                        int(value) for value in teacher["top1_count"][row]
+                    ],
+                    valid_tokens=teacher["valid_tokens"],
+                    document_id=(
+                        subset.document_ids[row]
+                        if subset.document_ids is not None
+                        else subset.source_ids[row]
+                    ),
+                    domain=(
+                        subset.domains[row]
+                        if subset.domains is not None
+                        else "synthetic"
+                    ),
+                    token_hash=(
+                        subset.token_hashes[row]
+                        if subset.token_hashes is not None
+                        else ""
+                    ),
+                    corpus_offset=(
+                        subset.offsets[row] if subset.offsets is not None else -1
+                    ),
+                    shape=f"p{subset.prompt_len}c{subset.continuation_len}",
                 )
             )
 
@@ -490,6 +718,13 @@ def collect(config: TrajectoryConfig) -> tuple[list[RequestRecord], np.ndarray, 
             "*_agreement": "relative to full depth, not to the truth",
         },
         "model_config": asdict(model.config),
+        "corpus_metadata": corpus_metadata,
+        "aggregation": (
+            "corpus NLL = sum(teacher_forced_nll_sum) / sum(valid_tokens). "
+            "Averaging teacher_forced_nll across requests weights a short "
+            "request the same as a long one."
+        ),
+        "clustering_unit": "document_id",
     }
     return records, np.concatenate(feature_blocks), metadata
 
@@ -574,6 +809,34 @@ def parse_args(argv: list[str] | None = None) -> TrajectoryConfig:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--out", dest="out_dir", default="results/trajectories")
+    parser.add_argument(
+        "--corpus",
+        default="synthetic",
+        choices=CORPORA,
+        help=(
+            "'real_text' draws from a tokenized corpus and is the only setting "
+            "whose output belongs in a paper; 'synthetic' is a mechanism test."
+        ),
+    )
+    parser.add_argument(
+        "--data",
+        default="data/val.bin",
+        help="Token file for --corpus=real_text.",
+    )
+    parser.add_argument(
+        "--eos_id",
+        type=lambda value: None if value.lower() == "none" else int(value),
+        default=None,
+        help=(
+            "End-of-text token id, used to find document boundaries. Omitting it "
+            "makes the clustered bootstrap degenerate to an unclustered one."
+        ),
+    )
+    parser.add_argument(
+        "--shapes",
+        default="64:32,128:64,256:128",
+        help="Comma-separated prompt:continuation lengths for --corpus=real_text.",
+    )
     parser.add_argument("--n_requests", type=int, default=1024)
     parser.add_argument("--validation_fraction", type=float, default=0.25)
     parser.add_argument("--probe_depth", type=int, default=1)
@@ -587,7 +850,11 @@ def parse_args(argv: list[str] | None = None) -> TrajectoryConfig:
         default=True,
         metavar="BOOL",
     )
-    return TrajectoryConfig(**vars(parser.parse_args(argv)))
+    parsed = vars(parser.parse_args(argv))
+    parsed["shapes"] = tuple(
+        part.strip() for part in parsed["shapes"].split(",") if part.strip()
+    )
+    return TrajectoryConfig(**parsed)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -602,7 +869,10 @@ def main(argv: list[str] | None = None) -> None:
         config=asdict(config),
         seeds={"corpus": config.seed, "backbone": config.seed,
                "split": config.seed},
-        inputs={"checkpoint": config.checkpoint or "trained in-process"},
+        inputs={
+            "checkpoint": config.checkpoint or "trained in-process",
+            **({"corpus": config.data} if config.corpus == "real_text" else {}),
+        },
         notes=[
             "Request-level depth capping involves no cache approximation: "
             "every executed layer sees exact keys and values.",

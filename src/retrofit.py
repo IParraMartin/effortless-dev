@@ -362,6 +362,73 @@ def load_parent(
     return parent, config
 
 
+def restore(path: str | Path, device: torch.device | str = "cpu") -> nn.Module:
+    """Loads a retrofitted checkpoint, rebuilding the modules it was saved with.
+
+    Wrapping a projection with :class:`LoRALinear` renames its weight from
+    ``blocks.0.attn.q_proj.weight`` to ``blocks.0.attn.q_proj.base.weight``. A
+    plain :class:`src.model.Transformer` therefore cannot load a LoRA checkpoint
+    at all — every wrapped projection reads as a missing key, and a loader that
+    waved that through with ``strict=False`` would return a model whose attention
+    was left at its random initialization while reporting success.
+
+    So the retrofit configuration has to be replayed before the weights are
+    loaded. It is stored in the checkpoint for exactly this reason.
+
+    Args:
+        path: Checkpoint written by ``experiments.retrofit_parent``.
+        device: Device to place the model on.
+
+    Returns:
+        The model, in eval mode with gradients disabled.
+
+    Raises:
+        FileNotFoundError: If the checkpoint is absent.
+        KeyError: If it carries no architecture.
+        ValueError: If any parameter is still missing after the modules are
+            rebuilt, which means the checkpoint and its recorded retrofit
+            disagree.
+    """
+    from src.model import Transformer
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found.")
+
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if "model_config" not in blob:
+        raise KeyError(f"{path} carries no 'model_config'.")
+
+    model = Transformer(blob["model_config"])
+
+    recorded = blob.get("retrofit")
+    if recorded:
+        settings = RetrofitConfig(
+            **{
+                name: (
+                    tuple(value) if isinstance(value, list) else value
+                )
+                for name, value in recorded.items()
+            }
+        )
+        if settings.mode in ("lora", "qlora"):
+            apply_lora(model, settings)
+
+    incompatible = model.load_state_dict(blob["model"], strict=False)
+    if incompatible.missing_keys:
+        raise ValueError(
+            f"{path} is missing {len(incompatible.missing_keys)} parameter(s) "
+            f"after replaying its recorded retrofit "
+            f"({(recorded or {}).get('mode', 'none')}), starting with "
+            f"{incompatible.missing_keys[:3]}. The checkpoint and its retrofit "
+            f"record disagree; loading anyway would leave part of the model at "
+            f"its random initialization."
+        )
+
+    model.to(device).eval().requires_grad_(False)
+    return model
+
+
 def retrofit(
     parent: nn.Module,
     config: RetrofitConfig,

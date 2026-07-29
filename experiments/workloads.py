@@ -51,6 +51,7 @@ returns a null by construction rather than by fact.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 
@@ -116,6 +117,17 @@ class Workload:
     difficulty: list[str]
     source_ids: list[int]
     spec: dict = field(default_factory=dict)
+    #: Identity of the document each request was cut from. ``None`` for the
+    #: synthetic corpus, where requests are generated rather than sampled.
+    document_ids: list[int] | None = None
+    #: Content digest of each request's tokens, so a record identifies the bytes
+    #: it was scored on rather than the offsets they happened to live at.
+    token_hashes: list[str] | None = None
+    #: Where each request begins in the underlying token file.
+    offsets: list[int] | None = None
+    #: Free-form label carried through to the record, for source-level shift
+    #: analysis. Uniform when the corpus has no domain metadata.
+    domains: list[str] | None = None
 
     def __len__(self) -> int:
         """Number of requests."""
@@ -145,12 +157,20 @@ class Workload:
             A new workload holding those requests.
         """
         index = torch.tensor(rows, dtype=torch.long)
+
+        def subset(values: list | None) -> list | None:
+            return None if values is None else [values[row] for row in rows]
+
         return Workload(
             prompts=self.prompts.index_select(0, index),
             references=self.references.index_select(0, index),
             difficulty=[self.difficulty[row] for row in rows],
             source_ids=[self.source_ids[row] for row in rows],
             spec=dict(self.spec),
+            document_ids=subset(self.document_ids),
+            token_hashes=subset(self.token_hashes),
+            offsets=subset(self.offsets),
+            domains=subset(self.domains),
         )
 
 
@@ -292,6 +312,244 @@ def mixed_difficulty_corpus(
             "hard_fraction": hard_fraction,
         },
     )
+
+
+@dataclass(frozen=True)
+class RequestShape:
+    """One prompt/continuation length pair.
+
+    Cost is a function of request shape, not a scalar per tier: prefill scales
+    with the prompt and decode scales with the context as it grows. A collection
+    that used one shape everywhere would produce a cost model that cannot be
+    queried for anything else, so requests are drawn across several shapes and
+    each record carries its own.
+
+    Attributes:
+        prompt_len: Prompt tokens.
+        continuation_len: Reference continuation tokens.
+    """
+
+    prompt_len: int
+    continuation_len: int
+
+    @property
+    def total(self) -> int:
+        """Tokens the request occupies end to end."""
+        return self.prompt_len + self.continuation_len
+
+    def label(self) -> str:
+        """A short identifier used in shard filenames and records."""
+        return f"p{self.prompt_len}c{self.continuation_len}"
+
+
+#: Shapes the real-text collector draws by default. Chosen so prefill and decode
+#: costs differ materially across them; a shape sweep that varies only slightly
+#: cannot separate the two components.
+DEFAULT_SHAPES = (
+    RequestShape(64, 32),
+    RequestShape(128, 64),
+    RequestShape(256, 128),
+)
+
+
+def real_text_corpus(
+    path: str | Path,
+    shapes: tuple[RequestShape, ...] = DEFAULT_SHAPES,
+    n_requests: int = 1024,
+    eos_id: int | None = None,
+    seed: int = 0,
+    split: str = "validation",
+) -> tuple[list[Workload], dict]:
+    """Draws requests from a tokenized corpus written by ``training.data``.
+
+    This is what replaces :func:`mixed_difficulty_corpus` for anything that will
+    be reported. The synthetic corpus remains a mechanism test: its depth
+    structure is a rule the experimenter installed, so measuring a controller on
+    it says whether the machinery works, not whether real prompts vary in the
+    depth they need.
+
+    Three design choices are worth stating, because each one removes a way the
+    collection could be wrong rather than merely inconvenient:
+
+    **No padding, ever.** Requests are grouped into one workload per shape, so
+    every tensor is rectangular without a pad token in it. The model's attention
+    is causal-only and has no padding mask, so a padded batch would let real
+    positions attend to pad positions and silently corrupt every score. Bucketing
+    by shape also makes per-shape cost exact instead of averaged.
+
+    **Requests do not straddle documents.** With ``eos_id`` given, document
+    boundaries are found exactly and every request is a contiguous slice inside
+    one document. A slice spanning an end-of-text boundary is a request whose
+    continuation is unrelated to its prompt, which would depress every endpoint
+    equally and add noise the controller cannot predict.
+
+    **The document is the cluster.** ``source_ids`` is the document id, so a
+    clustered bootstrap resamples documents rather than requests. Two requests
+    from one document are not independent observations, and treating them as such
+    narrows every interval the evaluation reports.
+
+    Args:
+        path: Path to a ``.bin`` written by ``python -m training.data``.
+        shapes: Request shapes to draw. Requests are spread evenly across them.
+        n_requests: Total requests to draw.
+        eos_id: End-of-text token id. When ``None``, document boundaries are
+            unknown and the whole file is treated as one document — which makes
+            the clustered bootstrap degenerate to the unclustered one, so the
+            returned metadata records that this happened.
+        seed: Seed for offset selection.
+        split: Split label recorded on every request.
+
+    Returns:
+        A tuple ``(workloads, metadata)`` with one workload per shape that got at
+        least one request, and metadata describing the corpus, the tokenizer, the
+        document count and the shapes drawn.
+
+    Raises:
+        FileNotFoundError: If the token file does not exist.
+        ValueError: If ``n_requests`` is not positive, or if no document is long
+            enough for the shortest requested shape — a silent empty collection
+            would look like a successful run that measured nothing.
+    """
+    import hashlib
+
+    import numpy as np
+
+    from training.data import read_meta
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Build it with 'python -m training.data'."
+        )
+    if n_requests < 1:
+        raise ValueError(f"n_requests must be positive, got {n_requests}.")
+
+    meta = read_meta(path)
+    tokens = np.memmap(path, dtype=np.dtype(meta["dtype"]), mode="r")
+
+    segments = _document_segments(tokens, eos_id)
+    shortest = min(shape.total for shape in shapes)
+    usable = [(start, end) for start, end in segments if end - start >= shortest]
+    if not usable:
+        raise ValueError(
+            f"no document in {path} holds {shortest} tokens, the shortest "
+            f"requested shape. Either the corpus is tiny or eos_id={eos_id} is "
+            f"wrong for this tokenizer, which would split on the wrong token."
+        )
+
+    rng = np.random.default_rng(seed)
+    per_shape: dict[RequestShape, list[dict]] = {shape: [] for shape in shapes}
+
+    # Round-robin over shapes so a truncated collection is still balanced across
+    # them, rather than holding every short request and no long ones.
+    for request in range(n_requests):
+        shape = shapes[request % len(shapes)]
+        candidates = [
+            index
+            for index, (start, end) in enumerate(usable)
+            if end - start >= shape.total
+        ]
+        if not candidates:
+            continue
+        document = int(rng.choice(candidates))
+        start, end = usable[document]
+        offset = int(rng.integers(start, end - shape.total + 1))
+        block = np.asarray(tokens[offset : offset + shape.total], dtype=np.int64)
+        per_shape[shape].append(
+            {
+                "document": document,
+                "offset": offset,
+                "tokens": block,
+                "hash": hashlib.sha256(block.tobytes()).hexdigest()[:32],
+            }
+        )
+
+    workloads = []
+    for shape, drawn in per_shape.items():
+        if not drawn:
+            continue
+        stacked = torch.from_numpy(np.stack([item["tokens"] for item in drawn]))
+        workloads.append(
+            Workload(
+                prompts=stacked[:, : shape.prompt_len],
+                references=stacked[:, shape.prompt_len :],
+                difficulty=["unknown"] * len(drawn),
+                source_ids=[item["document"] for item in drawn],
+                document_ids=[item["document"] for item in drawn],
+                token_hashes=[item["hash"] for item in drawn],
+                offsets=[item["offset"] for item in drawn],
+                domains=[meta.get("dataset_name", "unknown")] * len(drawn),
+                spec={
+                    "corpus": "real_text",
+                    "shape": shape.label(),
+                    "prompt_len": shape.prompt_len,
+                    "continuation_len": shape.continuation_len,
+                    "split": split,
+                },
+            )
+        )
+
+    drawn_total = sum(len(workload) for workload in workloads)
+    metadata = {
+        "corpus": "real_text",
+        "path": str(path),
+        "split": split,
+        "dataset_name": meta.get("dataset_name"),
+        "dataset_config": meta.get("dataset_config"),
+        "tokenizer_name": meta.get("tokenizer_name"),
+        "tokenizer_size": meta.get("tokenizer_size"),
+        "corpus_tokens": int(meta.get("n_tokens", tokens.size)),
+        "eos_id": eos_id,
+        "documents_found": len(segments),
+        "documents_long_enough": len(usable),
+        "requests_requested": n_requests,
+        "requests_drawn": drawn_total,
+        "shapes": [shape.label() for shape in shapes],
+        "seed": seed,
+    }
+    if eos_id is None:
+        metadata["clustering_note"] = (
+            "eos_id was not supplied, so document boundaries are unknown and the "
+            "whole file is treated as one document. source_id is therefore "
+            "constant and a clustered bootstrap degenerates to an unclustered "
+            "one, which reports intervals that are too narrow."
+        )
+    if drawn_total < n_requests:
+        metadata["truncation_note"] = (
+            f"{n_requests - drawn_total} request(s) were not drawn because no "
+            f"document was long enough for their shape"
+        )
+    return workloads, metadata
+
+
+def _document_segments(
+    tokens, eos_id: int | None
+) -> list[tuple[int, int]]:
+    """Finds document boundaries in a packed token file.
+
+    Args:
+        tokens: The token array.
+        eos_id: End-of-text token id, or ``None`` to treat the file as one
+            document.
+
+    Returns:
+        Half-open ``(start, end)`` ranges, one per document, excluding the
+        separator itself. Empty documents are dropped.
+    """
+    import numpy as np
+
+    if eos_id is None:
+        return [(0, int(tokens.size))]
+
+    breaks = np.flatnonzero(np.asarray(tokens) == eos_id)
+    segments, start = [], 0
+    for position in breaks:
+        if position > start:
+            segments.append((start, int(position)))
+        start = int(position) + 1
+    if start < tokens.size:
+        segments.append((start, int(tokens.size)))
+    return segments
 
 
 def split_by_source(
