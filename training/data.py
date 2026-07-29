@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from src.config import TrainConfig, parse_into
 from src.tokenizer import load_tokenizer
@@ -164,21 +164,185 @@ class PackedDataset(Dataset):
         return chunk[:-1], chunk[1:]
 
 
+class StatelessBlockSampler(Sampler[int]):
+    """Block order as a pure function of how many micro-batches have run.
+
+    A stateful loader cannot be resumed exactly. Its position lives in an
+    iterator inside worker processes, the epoch counter lives in the training
+    loop, and neither survives ``torch.save``. A run restarted from a
+    checkpoint therefore begins the corpus again, repeating data the model has
+    already seen and invalidating the token budget the run reports.
+
+    This sampler removes the state instead of trying to serialize it. It
+    defines one global stream of blocks::
+
+        position p  ->  epoch  = p // n_blocks
+                        offset = p %  n_blocks
+                        block  = permutation(seed, epoch)[offset]
+
+    and hands rank ``r`` the slice belonging to it::
+
+        p(micro_batch g, slot j) = g * batch_size * world_size
+                                 + r * batch_size
+                                 + j
+
+    Every property follows from that definition rather than from bookkeeping:
+    resuming means constructing the sampler with a different
+    ``start_micro_batch``; ranks read disjoint blocks because their slices are
+    disjoint; an epoch covers the corpus exactly once in total; and each epoch
+    reshuffles because the permutation is keyed on the epoch index.
+
+    The stream is unbounded, so the training loop no longer needs a cycling
+    wrapper and no longer has an epoch to set.
+
+    Args:
+        n_blocks: Number of blocks in the underlying dataset.
+        batch_size: Blocks per micro-batch, per rank.
+        world_size: Number of ranks sharing the stream.
+        rank: This process's index.
+        seed: The ``data_order`` seed. Not offset by rank here — the offset is
+            already in the position formula, so two ranks with the same seed
+            read different blocks by construction rather than by luck.
+        start_micro_batch: Global micro-batch index to begin at. On resume this
+            is ``completed_updates * grad_accum_steps``.
+        shuffle: When ``False`` the permutation is the identity, giving the
+            corpus in file order. Used for validation, where a fixed order
+            makes successive evaluations comparable.
+
+    Raises:
+        ValueError: If ``n_blocks`` or ``batch_size`` is not positive, or if
+            ``start_micro_batch`` is negative.
+    """
+
+    def __init__(
+        self,
+        n_blocks: int,
+        batch_size: int,
+        world_size: int = 1,
+        rank: int = 0,
+        seed: int = 0,
+        start_micro_batch: int = 0,
+        shuffle: bool = True,
+    ) -> None:
+        if n_blocks < 1:
+            raise ValueError(f"n_blocks must be positive, got {n_blocks}.")
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        if start_micro_batch < 0:
+            raise ValueError(
+                f"start_micro_batch must be non-negative, got {start_micro_batch}."
+            )
+
+        self.n_blocks = n_blocks
+        self.batch_size = batch_size
+        self.world_size = world_size
+        self.rank = rank
+        self.seed = seed
+        self.start_micro_batch = start_micro_batch
+        self.shuffle = shuffle
+
+        # One epoch's permutation at a time. Regenerating it costs a fraction of
+        # a second and keeping only the current one bounds memory at 8 bytes per
+        # block rather than 8 bytes per block per epoch.
+        self._epoch: int | None = None
+        self._permutation: np.ndarray | None = None
+
+    def block_at(self, position: int) -> int:
+        """Maps a stream position to a block index.
+
+        Args:
+            position: Position in the global stream, counted in blocks.
+
+        Returns:
+            The block this position reads. Deterministic in ``seed`` and
+            ``position`` alone, which is the property the resume test checks.
+        """
+        epoch, offset = divmod(position, self.n_blocks)
+        if not self.shuffle:
+            return int(offset)
+        if epoch != self._epoch:
+            self._permutation = np.random.default_rng(
+                [self.seed, epoch]
+            ).permutation(self.n_blocks)
+            self._epoch = epoch
+        return int(self._permutation[offset])
+
+    def positions_for(self, micro_batch: int) -> list[int]:
+        """Lists the stream positions this rank reads on one micro-batch.
+
+        Args:
+            micro_batch: Global micro-batch index.
+
+        Returns:
+            ``batch_size`` positions, contiguous within this rank's slice.
+        """
+        base = micro_batch * self.batch_size * self.world_size
+        start = base + self.rank * self.batch_size
+        return list(range(start, start + self.batch_size))
+
+    def blocks_for(self, micro_batch: int) -> list[int]:
+        """Lists the block indices this rank reads on one micro-batch.
+
+        Args:
+            micro_batch: Global micro-batch index.
+
+        Returns:
+            ``batch_size`` block indices, in the order the batch will hold them.
+        """
+        return [self.block_at(position) for position in self.positions_for(micro_batch)]
+
+    def __iter__(self):
+        """Yields block indices forever, starting at ``start_micro_batch``.
+
+        Yields:
+            Block indices in stream order. The loader's batch sampler groups
+            each consecutive ``batch_size`` of them into one micro-batch, so
+            grouping and this order agree by construction.
+        """
+        micro_batch = self.start_micro_batch
+        while True:
+            yield from self.blocks_for(micro_batch)
+            micro_batch += 1
+
+    def __len__(self) -> int:
+        """Never returns; the stream is unbounded by design.
+
+        Raises:
+            TypeError: Always. ``len()`` on an infinite stream has no answer,
+                and returning a plausible-looking number would let a caller
+                silently treat one epoch's worth of data as the whole run.
+        """
+        raise TypeError(
+            "StatelessBlockSampler is an unbounded stream and has no length. "
+            "Bound the run with TrainConfig.max_steps instead."
+        )
+
+
 def build_dataloader(
     path: str | Path,
     config: TrainConfig,
     world_size: int = 1,
     rank: int = 0,
     shuffle: bool = True,
+    seed: int | None = None,
+    start_micro_batch: int = 0,
 ) -> DataLoader:
     """Wraps a :class:`PackedDataset` in a loader, sharded across ranks.
 
+    The loader is unbounded: it yields batches until the caller stops asking.
+    Position in the corpus is carried by ``start_micro_batch`` rather than by
+    the iterator, which is what makes an interrupted run resumable to the same
+    data.
+
     Args:
         path: Path to the ``.bin`` file.
-        config: Run settings supplying batch size and worker count.
+        config: Run settings supplying batch size, worker count and seeds.
         world_size: Number of processes sharing the dataset.
         rank: This process's index.
         shuffle: Whether to shuffle block order.
+        seed: Data-order seed. Defaults to the resolved ``data_order`` stream of
+            ``config``.
+        start_micro_batch: Global micro-batch index to resume from.
 
     Returns:
         A loader yielding ``(input_ids, targets)`` batches. Under distribution
@@ -187,21 +351,32 @@ def build_dataloader(
     """
     dataset = PackedDataset(path, config.seq_len)
 
-    sampler = None
-    if world_size > 1:
-        sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
-        )
+    sampler = StatelessBlockSampler(
+        n_blocks=len(dataset),
+        batch_size=config.batch_size,
+        world_size=world_size,
+        rank=rank,
+        seed=config.seeds().data_order if seed is None else seed,
+        start_micro_batch=start_micro_batch,
+        shuffle=shuffle,
+    )
 
     return DataLoader(
         dataset,
         batch_size=config.batch_size,
-        shuffle=shuffle and sampler is None,
         sampler=sampler,
         num_workers=config.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
         persistent_workers=config.num_workers > 0,
+        # An explicit generator, so that constructing a loader iterator does not
+        # draw from the global stream. It draws one value to seed its workers,
+        # which is enough to shift every subsequent dropout mask by one and make
+        # a resumed run diverge from the run it restored -- an off-by-one nobody
+        # would find by reading the loss curve.
+        generator=torch.Generator().manual_seed(
+            (config.seeds().data_order if seed is None else seed) + 1_000_003 * rank
+        ),
     )
 
 

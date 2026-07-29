@@ -32,6 +32,7 @@ from __future__ import annotations
 import math
 import time
 from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -42,6 +43,7 @@ from utils.calibration import format_sweep, recommend_threshold, sweep_threshold
 from src.config import TrainConfig, TransformerConfig, parse_configs
 from training.data import build_dataloader
 from src.model import Transformer
+from utils.provenance import RunArtifacts
 from utils.tracking import RunTracker
 from src.tokenizer import config_from_tokenizer, load_tokenizer
 
@@ -113,6 +115,114 @@ def build_optimizer(
     )
 
 
+#: Version of the checkpoint layout. Version 1 held weights, optimizer state
+#: and a step count, which is enough to continue training but not enough to
+#: continue the *same* run: the data cursor, the exit rotation and every random
+#: stream restarted. Version 2 adds them.
+CHECKPOINT_SCHEMA_VERSION = 2
+
+
+def seed_everything(seed: int) -> None:
+    """Seeds every stream the process can draw from.
+
+    Seeding only ``torch`` leaves Python's and NumPy's generators at whatever
+    system entropy gave them, so two runs of the same configuration differ in
+    any code path that reaches for either — and a resumed run cannot restore a
+    position in a stream whose origin was never fixed.
+
+    Args:
+        seed: Value applied to Python, NumPy, and torch, including CUDA.
+    """
+    import random
+
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+
+
+def random_states() -> dict[str, object]:
+    """Captures every random stream the training loop draws from.
+
+    Omitting any one of these makes resume inexact in a way that is invisible
+    in the loss curve but real in the results: dropout masks repeat, and any
+    future sampling decision restarts from the top of its stream.
+
+    Returns:
+        A mapping of stream name to serializable state. CUDA states are a list
+        with one entry per visible device, empty off CUDA.
+    """
+    import random
+
+    import numpy as np
+
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        ),
+    }
+
+
+def restore_random_states(states: dict[str, object]) -> None:
+    """Restores the streams captured by :func:`random_states`.
+
+    Args:
+        states: A mapping produced by :func:`random_states`. Missing keys are
+            skipped, so a version 1 checkpoint still loads — it simply cannot
+            promise exactness, which the caller reports.
+
+    Note:
+        CUDA states are restored only when the current process has at least as
+        many devices as the checkpoint recorded. Restoring four devices' states
+        onto two would silently drop two streams, and a resume that quietly
+        differs is worse than one that says it does.
+    """
+    import random
+
+    import numpy as np
+
+    if "python" in states:
+        random.setstate(_as_tuple(states["python"]))
+    if "numpy" in states:
+        np.random.set_state(_as_tuple(states["numpy"]))
+    if "torch_cpu" in states:
+        torch.set_rng_state(states["torch_cpu"].cpu())
+    cuda = states.get("torch_cuda") or []
+    if cuda and torch.cuda.is_available():
+        if torch.cuda.device_count() < len(cuda):
+            print(
+                f"  warning: checkpoint holds {len(cuda)} CUDA RNG states but "
+                f"this process sees {torch.cuda.device_count()} devices; CUDA "
+                f"streams not restored, so resume is not exact.",
+                flush=True,
+            )
+        else:
+            torch.cuda.set_rng_state_all([state.cpu() for state in cuda])
+
+
+def _as_tuple(value):
+    """Recursively converts lists back into tuples.
+
+    ``random.setstate`` and ``numpy.random.set_state`` require tuples, and a
+    round trip through some serializers turns them into lists.
+
+    Args:
+        value: A possibly nested structure.
+
+    Returns:
+        The same structure with every list replaced by a tuple.
+    """
+    if isinstance(value, list):
+        return tuple(_as_tuple(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_as_tuple(item) for item in value)
+    return value
+
+
 def save_checkpoint(
     path: Path,
     model: Transformer,
@@ -120,25 +230,52 @@ def save_checkpoint(
     step: int,
     model_config: TransformerConfig,
     train_config: TrainConfig,
+    scaler: torch.amp.GradScaler | None = None,
+    tokens: int | None = None,
+    lineage: list[dict] | None = None,
 ) -> None:
-    """Writes everything needed to resume.
+    """Writes everything needed to resume the same run, not merely a run.
 
     Args:
         path: Destination file.
         model: The unwrapped model, never the DDP wrapper.
         optimizer: Optimizer whose moments are saved alongside the weights.
-        step: Number of completed optimizer steps.
+        step: Number of *completed* optimizer updates. The data cursor is
+            derived from this, so an off-by-one here repeats or skips a batch.
         model_config: Architecture the weights belong to.
         train_config: Run settings, stored so a resumed run is reproducible.
+        scaler: Gradient scaler, whose scale factor is part of the optimization
+            state under fp16.
+        tokens: Tokens consumed so far, recorded rather than recomputed so that
+            a run whose batch size changed mid-flight still reports a true
+            budget.
+        lineage: One entry per launch that contributed to this checkpoint.
+
+    Note:
+        The data cursor is deliberately absent. :class:`StatelessBlockSampler`
+        derives its position from ``step``, so there is no cursor to save and no
+        way for one to drift out of agreement with the update count.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "step": step,
+            "completed_updates": step,
+            "completed_tokens": tokens,
             "model_config": model_config,
             "train_config": train_config,
+            "seeds": asdict(train_config.seeds()),
+            # Not in state_dict: registered with persistent=False, because it
+            # is a schedule position rather than a parameter. It still decides
+            # which exits a step scores, so a resume that drops it trains a
+            # different rotation than the run it claims to continue.
+            "step_counter": int(model._step_counter.item()),
+            "random_states": random_states(),
+            "lineage": list(lineage or []),
         },
         path,
     )
@@ -251,9 +388,13 @@ def main(
     """
     context = distributed.setup(train_config.ddp_backend)
     device = context.device
+    seeds = train_config.seeds()
 
-    # Ranks share a model init but must not walk the data in lockstep.
-    torch.manual_seed(train_config.seed + context.rank)
+    # Initialization is seeded without a rank offset, so that two arms of a
+    # causal comparison can branch from the same parameters. DDP would
+    # broadcast rank zero's weights anyway, but a rank offset would also make a
+    # single-process run differ from rank zero of a distributed one.
+    seed_everything(seeds.model_init)
 
     tokenizer = load_tokenizer(train_config.tokenizer_name)
     model_config = config_from_tokenizer(
@@ -262,12 +403,14 @@ def main(
 
     start_step = 0
     checkpoint = None
+    lineage: list[dict] = []
     if train_config.resume_from is not None:
         checkpoint = torch.load(
             train_config.resume_from, map_location="cpu", weights_only=False
         )
         model_config = checkpoint["model_config"]
-        start_step = checkpoint["step"]
+        start_step = checkpoint.get("completed_updates", checkpoint["step"])
+        lineage = list(checkpoint.get("lineage", []))
 
     model = Transformer(model_config).to(device)
     if checkpoint is not None:
@@ -281,11 +424,56 @@ def main(
     )
     tracker = RunTracker(train_config, model_config, context.is_main)
 
+    # The local record, written whether or not a tracking service was
+    # reachable. Rank zero owns it; other ranks would interleave writes into the
+    # same files for no added information.
+    artifacts = None
+    if context.is_main:
+        artifacts = RunArtifacts.create(
+            Path(train_config.out_dir) / "run",
+            script="training.train",
+            config={
+                "train": asdict(train_config),
+                "model": asdict(model_config),
+                "world_size": context.world_size,
+                "tokens_per_step": tokens_per_step,
+            },
+            seeds=seeds,
+            inputs={
+                "train_bin": str(Path(train_config.data_dir) / "train.bin"),
+                "val_bin": str(Path(train_config.data_dir) / "val.bin"),
+                "tokenizer_name": train_config.tokenizer_name,
+            },
+            parent_checkpoint=train_config.resume_from,
+            required=(),
+        )
+        artifacts.record_resume(
+            {
+                "start_update": start_step,
+                "max_steps": train_config.max_steps,
+                "resumed_from": train_config.resume_from,
+                "world_size": context.world_size,
+            }
+        )
+        lineage.append(
+            {
+                "start_update": start_step,
+                "resumed_from": train_config.resume_from,
+                "world_size": context.world_size,
+                "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+        )
+
     if context.is_main:
         print(f"model:  {model.num_parameters() / 1e6:.1f}M parameters")
         print(f"exits:  layers {model_config.exit_layers}")
         print(f"world:  {context.world_size} process(es) on {device}")
         print(f"tokens: {tokens_per_step:,} per optimizer step")
+        print(f"seeds:  {seeds}")
+        if start_step:
+            print(f"resume: from completed update {start_step:,}")
+        if artifacts is not None:
+            print(f"record: {artifacts.run_dir}")
         if tracker.enabled:
             print(f"wandb:  {train_config.wandb_project} ({train_config.wandb_mode})")
 
@@ -304,8 +492,15 @@ def main(
         )
 
     data_dir = Path(train_config.data_dir)
+    # The cursor is derived from the completed update count rather than restored
+    # from the loader, which is what makes resume land on the next unseen batch
+    # instead of the top of the corpus.
     train_loader = build_dataloader(
-        data_dir / "train.bin", train_config, context.world_size, context.rank
+        data_dir / "train.bin",
+        train_config,
+        context.world_size,
+        context.rank,
+        start_micro_batch=start_step * train_config.grad_accum_steps,
     )
     val_loader = build_dataloader(
         data_dir / "val.bin",
@@ -325,8 +520,28 @@ def main(
     scaler = torch.amp.GradScaler(
         device.type, enabled=dtype is torch.float16 and device.type == "cuda"
     )
+    if checkpoint is not None and checkpoint.get("scaler") is not None:
+        scaler.load_state_dict(checkpoint["scaler"])
 
-    batches = _infinite(train_loader)
+    # Ranks must not apply identical dropout masks, so this stream — unlike
+    # initialization — is offset by rank on purpose.
+    seed_everything(seeds.dropout + context.rank)
+    if checkpoint is not None:
+        if "random_states" in checkpoint:
+            restore_random_states(checkpoint["random_states"])
+            # raw_model, not model: under DDP or torch.compile the wrapper has
+            # no such buffer, and setting an attribute on the wrapper would
+            # leave the real rotation counter at zero.
+            raw_model._step_counter.fill_(int(checkpoint.get("step_counter", 0)))
+        elif context.is_main:
+            print(
+                f"  warning: {train_config.resume_from} predates checkpoint "
+                f"schema {CHECKPOINT_SCHEMA_VERSION} and carries no random or "
+                f"rotation state. Training continues; it is not the same run.",
+                flush=True,
+            )
+
+    batches = iter(train_loader)
     exit_layers = model_config.exit_layers
     started = time.time()
     model.train()
@@ -399,20 +614,35 @@ def main(
                     (step + 1 - start_step) * tokens_per_step / max(elapsed, 1e-6)
                 )
 
-                tracker.log(
-                    {
-                        "train/loss": mean_loss,
-                        "train/lr": lr,
-                        "train/tokens": (step + 1) * tokens_per_step,
-                        "train/tokens_per_sec": throughput,
-                        **(
-                            {"train/kv_reconstruction": kv_mean}
-                            if model_config.learned_kv_propagation
-                            else {}
-                        ),
-                    },
-                    step=step,
-                )
+                metrics = {
+                    "train/loss": mean_loss,
+                    "train/lr": lr,
+                    "train/tokens": (step + 1) * tokens_per_step,
+                    "train/tokens_per_sec": throughput,
+                    **(
+                        {"train/kv_reconstruction": kv_mean}
+                        if model_config.learned_kv_propagation
+                        else {}
+                    ),
+                }
+                tracker.log(metrics, step=step)
+                if artifacts is not None:
+                    # Both indices, because the earlier runs reported one and
+                    # left readers to guess: the zero-based index a dashboard
+                    # shows is one less than the number of updates completed,
+                    # and the token budget follows the latter.
+                    artifacts.log_metric(
+                        {
+                            "global_step_index": step,
+                            "completed_updates": step + 1,
+                            **metrics,
+                            **{
+                                f"train/exit_ce_L{layer}": float(totals[i] / counts[i])
+                                for i, layer in enumerate(exit_layers)
+                                if counts[i] > 0
+                            },
+                        }
+                    )
                 tracker.log_exit_losses(
                     {
                         layer: float(totals[i] / counts[i])
@@ -459,6 +689,18 @@ def main(
                 print(f"  eval  loss {val_loss:.4f}  exits {summary}", flush=True)
                 tracker.log({"eval/loss": val_loss}, step=step)
                 tracker.log_exit_losses(val_exits, step=step, prefix="eval")
+                if artifacts is not None:
+                    artifacts.log_metric(
+                        {
+                            "global_step_index": step,
+                            "completed_updates": completed,
+                            "eval/loss": val_loss,
+                            **{
+                                f"eval/exit_ce_L{layer}": value
+                                for layer, value in sorted(val_exits.items())
+                            },
+                        }
+                    )
 
         if train_config.sweep_every and completed % train_config.sweep_every == 0:
             _report_sweep(
@@ -469,7 +711,15 @@ def main(
             if context.is_main:
                 path = Path(train_config.out_dir) / f"step-{completed:06d}.pt"
                 save_checkpoint(
-                    path, raw_model, optimizer, completed, model_config, train_config
+                    path,
+                    raw_model,
+                    optimizer,
+                    completed,
+                    model_config,
+                    train_config,
+                    scaler=scaler,
+                    tokens=completed * tokens_per_step,
+                    lineage=lineage,
                 )
                 print(f"  saved {path}", flush=True)
             distributed.barrier(context)
@@ -483,8 +733,20 @@ def main(
             train_config.max_steps,
             model_config,
             train_config,
+            scaler=scaler,
+            tokens=train_config.max_steps * tokens_per_step,
+            lineage=lineage,
         )
         print(f"done, saved {path}", flush=True)
+        if artifacts is not None:
+            artifacts.record_resume(
+                {
+                    "finished": True,
+                    "completed_updates": train_config.max_steps,
+                    "completed_tokens": train_config.max_steps * tokens_per_step,
+                    "final_checkpoint": str(path),
+                }
+            )
 
     tracker.finish()
     distributed.cleanup(context)
@@ -544,25 +806,6 @@ def _report_sweep(
             },
             step=step,
         )
-
-
-def _infinite(loader: torch.utils.data.DataLoader):
-    """Cycles a loader forever, reshuffling each epoch.
-
-    Args:
-        loader: Loader to repeat.
-
-    Yields:
-        Batches, restarting when the loader is exhausted. The distributed
-        sampler is re-seeded per epoch so ranks do not repeat the same shard
-        order.
-    """
-    epoch = 0
-    while True:
-        if hasattr(loader.sampler, "set_epoch"):
-            loader.sampler.set_epoch(epoch)
-        yield from loader
-        epoch += 1
 
 
 if __name__ == "__main__":

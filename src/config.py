@@ -554,7 +554,19 @@ class TrainConfig:
             ``0.999`` adapts too slowly for the loss spikes seen early on.
         dtype: Autocast precision, one of :data:`DTYPES`.
         compile_model: Whether to wrap the model in :func:`torch.compile`.
-        seed: Base random seed; each rank offsets it by its own index.
+        seed: Base seed. Every stream below is derived from it when left unset,
+            so a run is still specified by one number, but the streams are
+            separate so that changing one does not move the others.
+        model_init_seed: Parameter initialization. Deliberately *not* offset by
+            rank: two arms meant to branch from a common parent cannot do so if
+            their constructors consumed different random streams.
+        data_order_seed: Which blocks each rank reads, in which order. The rank
+            offset lives in the sampler's position formula rather than in this
+            seed, so ranks read disjoint data by construction.
+        dropout_seed: Stochastic regularization. Offset by rank on purpose, so
+            ranks do not apply identical masks.
+        exit_sampling_seed: Which exits a capped step scores. Must be identical
+            across ranks or gradients diverge silently.
         num_workers: Dataloader worker processes per rank.
         ddp_backend: Collective backend. ``"nccl"`` on CUDA, ``"gloo"``
             otherwise; ``"auto"`` picks based on device availability.
@@ -601,6 +613,10 @@ class TrainConfig:
     dtype: str = "bf16"
     compile_model: bool = True
     seed: int = 1337
+    model_init_seed: int | None = None
+    data_order_seed: int | None = None
+    dropout_seed: int | None = None
+    exit_sampling_seed: int | None = None
     num_workers: int = 2
 
     ddp_backend: str = "auto"
@@ -652,6 +668,28 @@ class TrainConfig:
             )
         if self.grad_clip < 0:
             raise ValueError(f"grad_clip must be non-negative, got {self.grad_clip}.")
+
+    def seeds(self):
+        """Resolves the named random streams this run consumes.
+
+        Returns:
+            A :class:`utils.provenance.Seeds` instance. Streams left unset on
+            the command line are derived from :attr:`seed`, so the common case
+            stays a single number while any stream remains independently
+            settable.
+        """
+        # Imported here rather than at module scope: config.py is imported by
+        # everything, and provenance pulls in subprocess and importlib.metadata
+        # for facts that only a run needs.
+        from utils.provenance import Seeds
+
+        return Seeds.resolve(
+            self.seed,
+            model_init=self.model_init_seed,
+            data_order=self.data_order_seed,
+            dropout=self.dropout_seed,
+            exit_sampling=self.exit_sampling_seed,
+        )
 
 
 _T = TypeVar("_T")
