@@ -357,17 +357,21 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class ReachableCeiling(unittest.TestCase):
-    """The conditional oracle separates learnable headroom from luck.
+class CrossFittedProbePolicy(unittest.TestCase):
+    """An information-respecting comparator separates real headroom from luck.
 
-    The plain oracle maximizes over candidates per request, which requires the
+    The outcome oracle maximizes over candidates per request, which requires the
     outcome. When per-request quality carries noise the router cannot predict,
-    that maximization manufactures headroom nobody can reach — and a router
+    that maximization manufactures headroom no policy can reach — and a router
     judged against it is reported as failing when it is optimal.
+
+    This comparator is fitted out of fold from the probe features only, so it
+    obeys the same information constraint as the controller. It is not a
+    ceiling: another model class can beat it.
     """
 
     def test_recovers_gain_that_is_predictable_from_features(self) -> None:
-        from experiments.evaluate_vertical_routing import conditional_oracle
+        from experiments.evaluate_vertical_routing import cross_fitted_probe_policy
 
         rng = np.random.default_rng(0)
         n = 400
@@ -379,14 +383,14 @@ class ReachableCeiling(unittest.TestCase):
         quality = np.where(flag[:, None] == 1, [0.2, 0.9], [0.9, 0.2]).astype(float)
         cost = np.tile(np.array([0.5, 1.0]), (n, 1))
 
-        ceiling = conditional_oracle(features, quality, cost, 0.0, steps=250)
+        ceiling = cross_fitted_probe_policy(features, quality, cost, 0.0, steps=250)
         best_fixed = quality.mean(0).max()
         # Predictable structure: the ceiling should capture most of it.
         self.assertGreater(ceiling.mean_quality, best_fixed + 0.2)
 
     def test_does_not_manufacture_gain_from_pure_noise(self) -> None:
         from experiments.evaluate_vertical_routing import (
-            conditional_oracle, oracle_system,
+            cross_fitted_probe_policy, oracle_system,
         )
 
         rng = np.random.default_rng(1)
@@ -397,10 +401,10 @@ class ReachableCeiling(unittest.TestCase):
         cost = np.tile(np.array([1 / 3, 2 / 3, 1.0]), (n, 1))
 
         plain = oracle_system(quality, cost, 0.0)
-        ceiling = conditional_oracle(features, quality, cost, 0.0, steps=250)
+        ceiling = cross_fitted_probe_policy(features, quality, cost, 0.0, steps=250)
         best_fixed = quality.mean(0).max()
 
         # The plain oracle invents a large gain out of the noise...
         self.assertGreater(plain.mean_quality - best_fixed, 0.15)
-        # ...while the reachable ceiling stays near the best fixed candidate.
+        # ...while the probe policy stays near the best fixed candidate.
         self.assertLess(abs(ceiling.mean_quality - best_fixed), 0.08)

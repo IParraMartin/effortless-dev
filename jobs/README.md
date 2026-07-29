@@ -142,14 +142,14 @@ worth knowing before spending anything on a model family.
 
 ## Reading the routing result
 
-`route.sh` prints the adaptivity table at the end. **Read `learnable gain`, not
+`route.sh` prints the adaptivity table at the end. **Read `probe-policy gain`, not
 `oracle − best fixed`.** The plain oracle chooses per request by knowing how
 each candidate turned out, which no deployable policy can. On the toy workload
-in this repository the plain oracle showed +0.051 while the reachable ceiling
+in this repository the outcome oracle showed +0.051 while the cross-fitted probe policy
 was +0.008 — 85% of the apparent headroom was unreachable by construction, and
 judging the controller against it reported a near-optimal policy as a failure.
 
-If `learnable gain` is near zero on real text as well, request-level routing has
+If `probe-policy gain` is near zero on real text as well, request-level routing has
 no case and no amount of controller work will create one. That is the go/no-go,
 and it costs one job.
 

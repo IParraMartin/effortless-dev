@@ -17,7 +17,10 @@ Vertical, all from one backbone:
 * the entropy threshold — the token-level heuristic, retained because it is
   what the prior literature uses;
 * the learned request-level router;
-* the request-level oracle over the same tiers — the ceiling;
+* the request-level outcome oracle over the same tiers — a diagnostic, not a
+  target: it chooses by looking at realized outcomes, so no policy can reach it;
+* a cross-fitted probe policy — one specified learner over the probe features,
+  which is what a controller should actually be measured against;
 * the best static randomized mixture at matched average cost. This one is easy
   to leave out and is the one that hurts: flipping a weighted coin between two
   fixed depths already produces a curve, so a router that merely lands on that
@@ -30,6 +33,11 @@ Horizontal, from independently trained checkpoints supplied by a manifest:
 * the horizontal oracle;
 * a small-to-large cascade, charged for the small model's run on requests that
   escalate.
+
+The two-tier ``vertical_no_reuse_oracle_cascade`` is **not** in the horizontal
+family despite its shape. Both cascade arms take their qualities from one
+backbone's depth endpoints and escalate on an outcome-based rule, so the pair
+measures what prefix reuse is worth and nothing about independent models.
 
 The manifest keeps this repository from having to train a model family to be
 useful. Without one, the horizontal side is reported as absent rather than
@@ -294,7 +302,7 @@ def oracle_system(
     )
 
 
-def conditional_oracle(
+def cross_fitted_probe_policy(
     features: np.ndarray,
     quality: np.ndarray,
     cost: np.ndarray,
@@ -304,28 +312,36 @@ def conditional_oracle(
     steps: int = 600,
     seed: int = 0,
 ) -> SystemResult:
-    """The best a router *could* do with the information it actually has.
+    """One reference policy fitted from the probe features, out of fold.
 
-    The plain oracle takes ``max`` over candidates per request, which requires
-    knowing how each one turned out. No policy can have that. Quoting it as the
-    ceiling for a learned router therefore charges the router for information it
+    The outcome oracle takes ``max`` over candidates per request, which requires
+    knowing how each one turned out. No deployable policy can have that. Quoting
+    it as the target for a learned router charges the router for information it
     was never given, and the difference is not a small correction: on this
-    repository's own workload the plain oracle reported +0.051 of headroom while
-    the achievable ceiling was **+0.008**, so 85% of the "gain" was unreachable
-    by construction. A router measured against it looks broken when it is
+    repository's own workload the outcome oracle reported +0.051 of headroom
+    while this policy attained **+0.008**, so 85% of that "gain" required the
+    answer. A router measured against the oracle looks broken when it is
     performing near optimally.
 
-    This estimates the reachable ceiling instead. A deliberately over-powered
-    per-tier quality regressor — larger than the controller under test — is fitted
-    on the probe features by K-fold cross-fitting, so its prediction for a request
-    never saw that request. Choosing by predicted utility and scoring by true
-    quality gives a policy that respects the information constraint while being
-    about as strong as any policy over these features can be.
+    So this is a second, information-respecting comparator. A deliberately
+    over-powered per-tier quality regressor — larger than the controller under
+    test — is fitted on the probe features by K-fold cross-fitting, so its
+    prediction for a request never saw that request. Choosing by predicted
+    utility and scoring by true quality gives a policy that obeys the same
+    information constraint as the controller.
 
-    It is an *estimate* of the ceiling, not a bound: a better predictor could do
-    better, and cross-fitting on few requests is noisy. Read it alongside the
-    plain oracle rather than instead of it — the gap between them is the part of
-    the headroom that depends on knowing the answer.
+    **This is not a ceiling and must not be called one.** It is the out-of-fold
+    performance of one specified learner from one model class. Another model
+    class can beat it, in which case the controller's "regret" against it goes
+    negative — a number that is meaningless if the comparator was described as a
+    bound. The theoretical best policy measurable from these features
+    (``feature_bayes_value`` in the naming convention) is not computed here and
+    is generally unknown.
+
+    Read it alongside the outcome oracle rather than instead of it. The gap
+    between them is the part of the headroom that depends on knowing the answer;
+    the gap between this and the best fixed endpoint is what a learner of this
+    class actually extracted.
 
     Args:
         features: Probe features shaped ``(n_requests, feature_dim)``.
@@ -378,15 +394,16 @@ def conditional_oracle(
     index = (predicted - routing_lambda * cost).argmax(axis=1)
     rows = np.arange(n)
     return SystemResult(
-        name="conditional_oracle",
+        name="cross_fitted_probe_policy",
         family="vertical",
         operating_point=routing_lambda,
         quality=quality[rows, index],
         cost=cost[rows, index],
         choices=index,
         notes=[
-            "cross-fitted ceiling: the best policy measurable from the probe "
-            "features, as opposed to the plain oracle which knows the outcome"
+            "out-of-fold performance of one specified learner on the probe "
+            "features; an information-respecting comparator, not a ceiling -- "
+            "another model class can beat it"
         ],
     )
 
@@ -584,12 +601,21 @@ def cascade_system(
 ) -> SystemResult:
     """Costs a two-tier cascade, charging the cheap pass on every request.
 
-    The difference between the two families lives entirely in the cost. A
-    horizontal cascade reruns an escalated request through the large model from
-    scratch, so it pays the small model's cost *plus* the large one's. A
-    vertical cascade continues through the suffix, so it pays the shallow
-    prefix only once. Charging both the same way would hand the vertical system
-    a saving it has not earned.
+    The difference between the two families lives entirely in the cost. Without
+    prefix reuse an escalated request is rerun from scratch, so it pays the cheap
+    path's cost *plus* the expensive one's. With reuse it continues through the
+    suffix and pays the shallow prefix once. Charging both the same way would
+    hand the reusing system a saving it has not earned.
+
+    Warning:
+        The no-reuse arm is **not** a horizontal model cascade, and is named
+        ``vertical_no_reuse_oracle_cascade`` to stop it being read as one. Both
+        arms draw their qualities from the *same* backbone's depth endpoints, and
+        both escalate using an outcome-based rule that a deployed system could not
+        evaluate. It measures what prefix reuse is worth, holding everything else
+        fixed. A real horizontal cascade needs independently trained models,
+        their own per-request predictions, measured per-shape serving costs, and
+        an escalation policy over available features only.
 
     Args:
         quality: Quality shaped ``(n_requests, 2)`` for the cheap and expensive
@@ -618,7 +644,8 @@ def cascade_system(
         notes=[
             "reusable prefix: escalation pays only the suffix"
             if reuse_prefix
-            else "no reuse: escalation reruns the cheap model's work"
+            else "no reuse: escalation reruns the cheap path's work. Same "
+            "backbone, oracle escalation -- not a horizontal model cascade"
         ],
     )
 
@@ -704,21 +731,23 @@ def estimands(
         # Splitting the gain into the part a policy over these features could
         # reach and the part it could not is what stops a near-optimal router
         # being reported as a failure.
-        ceiling = by_name.get(f"conditional_oracle@{lam}")
-        if ceiling is not None:
-            reachable = float((ceiling.quality - lam * ceiling.cost).mean())
-            entry["conditional_oracle_utility"] = reachable
-            entry["learnable_gain"] = reachable - best_fixed
-            entry["unlearnable_gain"] = oracle - reachable
+        probe_policy = by_name.get(f"cross_fitted_probe_policy@{lam}")
+        if probe_policy is not None:
+            attained = float(
+                (probe_policy.quality - lam * probe_policy.cost).mean()
+            )
+            entry["probe_policy_utility"] = attained
+            entry["probe_policy_gain"] = attained - best_fixed
+            entry["outcome_only_gain"] = oracle - attained
 
         router = by_name.get(f"learned_request_router@{lam}")
         if router is not None:
             achieved = float((router.quality - lam * router.cost).mean())
             entry["router_utility"] = achieved
             entry["router_regret"] = oracle - achieved
-            if "conditional_oracle_utility" in entry:
-                entry["router_regret_vs_reachable"] = (
-                    entry["conditional_oracle_utility"] - achieved
+            if "probe_policy_utility" in entry:
+                entry["router_regret_vs_probe_policy"] = (
+                    entry["probe_policy_utility"] - achieved
                 )
             entry["mean_depth"] = float(np.array(tiers)[router.choices].mean())
 
@@ -884,9 +913,9 @@ def evaluate(config: EvaluationConfig) -> dict:
     systems: list[SystemResult] = list(fixed_endpoints(quality, cost, tiers))
     systems += [oracle_system(quality, cost, lam) for lam in config.lambdas]
     for lam in config.lambdas:
-        ceiling = conditional_oracle(probe, quality, cost, lam, seed=config.seed)
-        ceiling.name = f"conditional_oracle@{lam}"
-        systems.append(ceiling)
+        estimated = cross_fitted_probe_policy(probe, quality, cost, lam, seed=config.seed)
+        estimated.name = f"cross_fitted_probe_policy@{lam}"
+        systems.append(estimated)
 
     if controller is not None:
         threshold = controller_blob["metrics"].get(
@@ -929,7 +958,7 @@ def evaluate(config: EvaluationConfig) -> dict:
         )
         systems.append(
             cascade_system(
-                pair_quality, pair_cost, escalate, False, "horizontal_cascade"
+                pair_quality, pair_cost, escalate, False, "vertical_no_reuse_oracle_cascade"
             )
         )
 
@@ -1066,16 +1095,16 @@ def format_markdown(results: dict) -> str:
         )
 
     lines += ["", "## Adaptivity gain and router regret", "",
-              "| lambda | oracle | reachable ceiling | best fixed | "
-              "**learnable** gain | unlearnable | router regret vs reachable | "
-              "mean depth | vs static mixture |",
+              "| lambda | outcome oracle | cross-fitted probe policy | best fixed | "
+              "**probe-policy** gain | outcome-only gain | "
+              "router regret vs probe policy | mean depth | vs static mixture |",
               "|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for entry in results["estimands"]["per_lambda"]:
-        regret = entry.get("router_regret_vs_reachable", entry.get("router_regret"))
+        regret = entry.get("router_regret_vs_probe_policy", entry.get("router_regret"))
         depth = entry.get("mean_depth")
-        reachable = entry.get("conditional_oracle_utility")
-        learnable = entry.get("learnable_gain")
-        unlearnable = entry.get("unlearnable_gain")
+        probe_policy = entry.get("probe_policy_utility")
+        probe_gain = entry.get("probe_policy_gain")
+        outcome_only = entry.get("outcome_only_gain")
         mixture = entry.get("vs_static_mixture")
         verdict = "n/a"
         if mixture is not None:
@@ -1087,26 +1116,32 @@ def format_markdown(results: dict) -> str:
         fmt = lambda v, w=4: "n/a" if v is None else f"{v:+.{w}f}"
         lines.append(
             f"| {entry['lambda']:.2f} | {entry['oracle_utility']:.4f} | "
-            f"{'n/a' if reachable is None else f'{reachable:.4f}'} | "
+            f"{'n/a' if probe_policy is None else f'{probe_policy:.4f}'} | "
             f"{entry['best_fixed_utility']:.4f} | "
-            f"**{fmt(learnable)}** | {fmt(unlearnable)} | "
+            f"**{fmt(probe_gain)}** | {fmt(outcome_only)} | "
             f"{fmt(regret)} | "
             f"{'n/a' if depth is None else f'{depth:.2f}'} | {verdict} |"
         )
 
     lines += [
         "",
-        "**Read the `learnable gain` column, not `oracle − best fixed`.** The "
-        "plain oracle picks per request by looking at how each candidate turned "
-        "out, which no policy can do; the reachable ceiling is a strong "
-        "cross-fitted predictor restricted to the probe features. The gap "
-        "between them is headroom no router can take. On this repository's own "
-        "workload the plain oracle showed +0.051 and the learnable part was "
-        "+0.008, so judging the router against the plain oracle would have "
-        "reported a near-optimal policy as a failure.",
+        "**Read the `probe-policy gain` column, not `outcome oracle - best "
+        "fixed`.** The outcome oracle picks per request by looking at how each "
+        "candidate turned out, which no deployable policy can do. The "
+        "cross-fitted probe policy is one specified learner restricted to the "
+        "probe features, fitted out of fold. The gap between them is headroom "
+        "that required the answer. On this repository's own workload the outcome "
+        "oracle showed +0.051 and the probe policy attained +0.008, so judging "
+        "the router against the outcome oracle would have reported a "
+        "near-optimal policy as a failure.",
         "",
-        "So: a large **learnable** gain with large regret against the reachable "
-        "ceiling is a *controller* problem. A small learnable gain is an "
+        "The probe policy is **not a ceiling**. It is the out-of-fold "
+        "performance of one model class, so a better learner can beat it and "
+        "the regret column can legitimately go negative. The theoretical best "
+        "policy measurable from these features is not computed here.",
+        "",
+        "So: a large probe-policy gain with large regret against the probe "
+        "policy is a *controller* problem. A small probe-policy gain is an "
         "*endpoint or feature* problem, and no amount of controller tuning will "
         "fix it.",
         "",

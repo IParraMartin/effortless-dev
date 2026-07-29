@@ -12,15 +12,15 @@
 #   $2  horizontal manifest   (optional)
 #
 # **This job answers the go/no-go question**, and it is the one to read first.
-# In the evaluation output, look at `learnable gain`, not `oracle - best fixed`.
+# In the evaluation output, look at `probe-policy gain`, not `outcome oracle - best fixed`.
 # The plain oracle chooses per request by knowing how each candidate turned out,
 # which no deployable policy can do. On the toy workload in this repository the
-# plain oracle showed +0.051 of headroom while the reachable ceiling — a strong
+# outcome oracle showed +0.051 of headroom while the cross-fitted probe policy — one
 # cross-fitted predictor restricted to the probe features — showed **+0.008**,
 # so 85% of the apparent gain was unreachable by construction, and judging the
 # controller against it reported a near-optimal policy as a failure.
 #
-# If `learnable gain` is around zero on real text too, request-level routing has
+# If `probe-policy gain` is around zero on real text too, request-level routing has
 # no case and no amount of controller work will create one. That result is worth
 # having early and it costs one job.
 #
