@@ -14,7 +14,9 @@ cut entries are retained with their reasons rather than deleted.
 
 **Project name:** Effortless Vertical Routing
 
-**Current phase:** After the first matched-token training pair; before a causal sharing-tax estimate or a production-valid routing benchmark.
+**Current phase:** Scope cut to three experiments (2026-07-29). The first two run
+on the checkpoint already on disk; the third is one GPU job. No endpoint has yet
+been scored on real held-out text. See `START_HERE.md`.
 
 ## Objective of the paper
 
@@ -70,22 +72,31 @@ Token-level depth adaptation and learned K/V propagation remain a later extensio
 
 ## Research questions
 
-1. Can shallow endpoints be added without degrading the parent model’s full-depth quality?
-2. At equal measured cost, how close are shared depth endpoints to independently trained same-family models?
-3. Is there meaningful per-request heterogeneity in the depth required for good predictions after controlling for a strong static mixture?
-4. Can a controller infer that heterogeneity from reusable shallow hidden states on untouched requests and distribution shifts?
-5. How much of theoretical MAC and K/V savings becomes actual TTFT, TPOT, throughput, memory, and energy improvement?
-6. When does horizontal model complementarity remain irreducible?
-7. Does request-level depth selection provide most of the gain, or is token-level adaptation necessary?
+Narrowed by the 2026-07-29 scope cut. The status column is the current one; the
+questions are kept in full so the narrowing is legible.
+
+| | question | status |
+|---|---|---|
+| 1 | Can shallow endpoints be added without degrading the parent's full-depth quality? | **live** — experiment A1 |
+| 2 | At equal measured cost, how close are shared depth endpoints to independently trained same-family models? | **live** — A3 |
+| 3 | Is there per-request heterogeneity in required depth, after controlling for a strong static mixture? | **live** — A2 |
+| 4 | Can a controller infer that heterogeneity from reusable shallow hidden states? | **live** — A2 |
+| 5 | How much of theoretical MAC and K/V saving becomes actual latency, throughput, memory and energy? | **partial** — K/V memory verified exactly; latency, throughput, goodput and energy unmeasured and not pursued |
+| 6 | When does horizontal model complementarity remain irreducible? | **dropped** — needs heterogeneous specialists, not one same-family suite |
+| 7 | Does request-level selection provide most of the gain, or is token-level adaptation necessary? | **dropped to future work** — its gating diagnostic was not built |
 
 ## Primary hypotheses
 
-- **H1 — no-regret endpoint:** the retrofitted model’s final endpoint is non-inferior to its frozen parent within a predeclared margin.
+- **H1 — no-regret endpoint:** the retrofitted model's final endpoint is non-inferior to its frozen parent within a predeclared margin.
+  *Instrument:* exact by construction in the frozen modes (`assert_parent_preserved`); `experiments/no_regret.py` for the rest. **Tested by A1.**
 - **H2 — useful tiers:** at least two shallow endpoints lie on the empirical quality–cost frontier after including all readout and controller costs.
+  *Instrument:* `pareto_frontier`, with adapter and LoRA MACs charged. **Tested by A1.**
 - **H3 — learnable adaptivity:** a cross-fitted request router beats the best exact static mixture at matched cost on an untouched reporting split.
+  *Instrument:* `probe_policy_gain` and the matched-cost mixture comparison, document-clustered. **Tested by A2.**
 - **H4 — partial substitution:** the vertical substitution ratio is materially above zero for adjacent same-family model tiers.
-- **H5 — systems realization:** measured serving benefits preserve a meaningful fraction of analytical compute savings at relevant batch sizes and arrival rates.
-- **H6 — boundary:** heterogeneous specialists retain a larger complementarity gap than adjacent same-family general-purpose models.
+  *Instrument:* `bootstrap_substitution_ratio`. **Tested by A3, and may be unreportable:** matching the token budget compresses the Pythia frontier — measured 0.016 bits/byte between 70m and 160m at `step1000` against 0.111 at `main` — and the ratio divides by that. If the denominator is too small, report the tax alone.
+- **H5 — systems realization: dropped.** The serving benchmark is cut. K/V memory is verified exactly; nothing else is claimed.
+- **H6 — boundary: dropped.** Requires heterogeneous specialists rather than one same-family suite.
 
 ## Evidence ledger
 

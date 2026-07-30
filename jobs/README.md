@@ -3,6 +3,10 @@
 Slurm scripts for `fc_bsclab`. Every one sources [`_env.sh`](_env.sh), which
 redirects the caches off the 10 GB home quota and configures Weights & Biases.
 
+**The plan lives in [../START_HERE.md](../START_HERE.md).** Of the three
+experiments it names, only the third needs the cluster — the first two run on the
+checkpoint already on disk. What follows is the cluster half.
+
 ```bash
 # once, on a login node
 bash jobs/setup_env.sh
@@ -11,18 +15,35 @@ uv run wandb login
 # confirm W&B works *from a compute node* before spending a GPU allocation
 sbatch --job-name=vr-wandb-check jobs/check_wandb.sh
 
-# 1. tokenize a corpus                (CPU, ~hours)
-sbatch --job-name=vr-data    jobs/prepare_data.sh
+# A3: score the Pythia family at a matched token budget   (1x A40, ~hours)
+sbatch --job-name=pythia jobs/pythia_family.sh step1000
 
-# 2. train the backbone               (1x A40; see sizing note below)
+# only if submitted with WANDB_MODE=offline
+bash jobs/sync_wandb.sh
+```
+
+### Scripts that belong to cut experiments
+
+Retained because cutting an experiment does not delete the means to run it, and
+because the Pile arms return if the frozen retrofit's tiers prove unusable. None
+of these is part of the current plan.
+
+```bash
+# tokenize a corpus with the GPT-NeoX tokenizer, matching Pythia's inputs
+sbatch --job-name=pile-prep jobs/prepare_pile.sh
+
+# the four controlled scratch arms: one serialized parent per seed, two arms each
+sbatch --job-name=vr-parent-s1 jobs/controlled_arms.sh parent 1
+sbatch --job-name=vr-s1-final  jobs/controlled_arms.sh final 1
+sbatch --job-name=vr-s1-multi  jobs/controlled_arms.sh multi 1
+
+# the original FineWeb-Edu preparation and the two 2026-07-27 training arms
+sbatch --job-name=vr-data    jobs/prepare_data.sh
 sbatch --job-name=vr-exits   jobs/train.sh exits
 sbatch --job-name=vr-noexits jobs/train.sh noexits
 
-# 3. route and evaluate               (1x A40, ~1h)
+# route and evaluate against a checkpoint
 sbatch --job-name=vr-route   jobs/route.sh checkpoints/vr-exits/final.pt
-
-# 4. only if submitted with WANDB_MODE=offline
-bash jobs/sync_wandb.sh
 ```
 
 ## Weights & Biases
@@ -129,29 +150,45 @@ sbatch --partition=savio4_gpu --qos=a5k_gpu4_normal --gres=gpu:A5000:1 \
 sbatch --export=ALL,MAX_STEPS=5000 --job-name=vr-exits-short jobs/train.sh exits
 ```
 
-## What the two training variants are for
+## What the two training variants were for, and why they are not the plan
 
-Together they are the **sharing tax**: the cheapest decisive experiment
-available. `exits` trains the elastic backbone; `noexits` sets
-`exit_every = n_layers`, leaving one exit on the final layer — an ordinary
-language model, no separate code path. Compare their **final-layer** quality at
-matched budget. Multi-exit training can degrade the top layer, because shallow
-exits pull representations toward early linear decodability. If that tax is
-large, the thesis loses to "train one good model and distill it", and it is
-worth knowing before spending anything on a model family.
+`train.sh exits` and `train.sh noexits` were the **sharing tax** experiment:
+train one backbone with exits and one without at matched budget, then compare
+final-layer quality. The two runs on disk came from these.
+
+**That comparison is retracted and the experiment is cut.** Two reasons, both in
+[../CURRENT.md](../CURRENT.md) under *Retracted*:
+
+1. The arms did not share a backbone initialization. Constructing exit modules
+   consumed random draws before the global initialization pass, so one exit and
+   six exits under the same seed produced different embeddings.
+   `jobs/controlled_arms.sh` fixes this by branching from a serialized parent.
+2. The legacy objective gave the six-exit arm's final endpoint `12/42 = 0.2857`
+   of the hard-target coefficient against the control's `1.0`. A degraded
+   endpoint follows from dividing its weight by 3.5, not from sharing.
+
+More importantly the question changed. The current method retrofits a **frozen**
+parent, which pays no sharing tax by construction — so measuring the tax would
+price a method the project is not proposing. It returns only if the frozen
+retrofit's shallow tiers turn out unusable.
 
 ## Reading the routing result
 
-`route.sh` prints the adaptivity table at the end. **Read `probe-policy gain`, not
-`oracle − best fixed`.** The plain oracle chooses per request by knowing how
-each candidate turned out, which no deployable policy can. On the toy workload
-in this repository the outcome oracle showed +0.051 while the cross-fitted probe policy
-was +0.008 — 85% of the apparent headroom was unreachable by construction, and
-judging the controller against it reported a near-optimal policy as a failure.
+`route.sh` prints the adaptivity table at the end. **Read `probe-policy gain`,
+not `outcome oracle − best fixed`.** The outcome oracle chooses per request by
+knowing how each candidate turned out, which no deployable policy can. On the toy
+workload the outcome oracle showed +0.051 while the cross-fitted probe policy
+attained +0.008 — 85% of the apparent headroom required the answer, and judging
+the controller against the oracle reported a near-optimal policy as a failure.
+Both figures are toy-workload numbers.
 
-If `probe-policy gain` is near zero on real text as well, request-level routing has
-no case and no amount of controller work will create one. That is the go/no-go,
-and it costs one job.
+The probe policy is **not a ceiling**: it is the out-of-fold performance of one
+model class, so a better learner can beat it and the regret column can
+legitimately go negative.
+
+If `probe-policy gain` is near zero on real text as well, request-level routing
+has no case and no amount of controller work will create one. That is the go/no-go
+in [../START_HERE.md](../START_HERE.md) step 2.
 
 ## Watching jobs
 

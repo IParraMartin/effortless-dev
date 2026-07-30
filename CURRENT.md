@@ -310,5 +310,5 @@ python -m experiments.benchmark_latency --out results/latency --device=cpu
 python -c "from src.config import TransformerConfig as C; \
   print([round(w,6) for w in C(n_layers=12, exit_every=2).exit_weights])"
 
-python -m unittest discover -s tests -t .   # 414 tests
+python -m unittest discover -s tests -t .   # 429 tests
 ```
