@@ -60,6 +60,7 @@ _find_env() {
     return 1
 }
 source "$(_find_env)"
+trap report_failure EXIT
 cd "$REPO_DIR"
 mkdir -p logs data
 
