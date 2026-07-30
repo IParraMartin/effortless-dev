@@ -33,9 +33,16 @@ The primary objective is to determine the region in which vertical routing is a 
 
 ## Current thesis
 
-> A strong full-depth parent can be retrofitted with shallow endpoints and a request-level value-of-depth controller so that the resulting elastic model preserves the parent’s full-depth quality, exposes several useful quality–cost operating points, and recovers a measurable fraction of the quality–cost advantage of routing among independent same-family models. Reusable probe computation and depth-capped K/V caches can provide systems benefits that horizontal cascades cannot obtain.
+> A strong full-depth parent can be retrofitted with shallow endpoints and a request-level value-of-depth controller so that the resulting elastic model preserves the parent’s full-depth quality, exposes several useful quality–cost operating points, and recovers a measurable fraction of the quality–cost advantage of routing among independent same-family models.
 
 This is a hypothesis, not yet an established result.
+
+**Narrowed 2026-07-29.** The thesis previously ended with a further clause: *"Reusable
+probe computation and depth-capped K/V caches can provide systems benefits that
+horizontal cascades cannot obtain."* That clause is withdrawn. K/V memory under a
+depth cap is verified to fall exactly `1 − d/L`, but turning an allocation saving
+into a *serving* benefit needs the benchmark that was cut, so the paper claims the
+invariant and no systems consequence of it.
 
 ## Paper innovations to target
 
@@ -66,9 +73,13 @@ The evaluation separates:
 - **systems realization gap:** theoretical compute savings versus measured latency, throughput, memory, and energy savings;
 - **vertical substitution ratio:** the fraction of horizontal frontier improvement recovered vertically.
 
-### 6. Optional token-level extension
+### 6. Token-level extension — cut
 
-Token-level depth adaptation and learned K/V propagation remain a later extension. They are not the headline contribution until request-level routing is correct, useful, and measurable on serving hardware.
+Token-level depth adaptation and learned K/V propagation were held as a later
+extension. **Cut to future work on 2026-07-29**, and cut rather than deferred: the
+diagnostic that would have gated them — token-level outcome-oracle gain beyond the
+request-level cap — was never built, so nothing is waiting on a measurement. The
+code remains in `src/model.py` and `experiments/exposure.py` and still runs.
 
 ## Research questions
 
@@ -99,6 +110,12 @@ questions are kept in full so the narrowing is legible.
 - **H6 — boundary: dropped.** Requires heterogeneous specialists rather than one same-family suite.
 
 ## Evidence ledger
+
+**This section is a snapshot dated 2026-07-29, taken before the implementation
+work recorded in the decision logs below.** Several of its entries have since
+changed status — exact resume, for instance, is now established by test, and the
+independent family now exists. It is kept unedited because the decision logs refer
+back to it. **For the live state of the evidence, read `CURRENT.md`.**
 
 ### Established by code inspection or deterministic tests
 

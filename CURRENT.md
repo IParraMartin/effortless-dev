@@ -212,41 +212,62 @@ built it.
 
 ## Not established
 
-Nothing below is blocked on missing code any more, except where it says so.
+Split by whether the project is still trying. The scope cut of 2026-07-29 turned
+several of these from "blocked" into "not pursued", which is a different
+statement and belongs on the record as one.
 
-- **Nothing about sharing.** See *Retracted*. A causal estimate needs two arms
-  from one serialized parent initialization under `anchored_v1`, with
-  `shallow_loss_weight` at 0 and at a nonzero value. **Runnable now.**
+### Still being pursued — the three remaining experiments
+
 - **No endpoint has been scored on real held-out text.** The collector can do it
-  (`--corpus real_text`) and the pipeline runs end to end, but it has not been
-  pointed at FineWeb-Edu with a real checkpoint. **Runnable now.**
-- **`probe-policy gain` is unmeasured on real text.** This is the go/no-go
-  number. On the toy workload the outcome oracle showed +0.051 of headroom while
-  the cross-fitted probe policy attained +0.008, so 85% of the apparent gain
-  required knowing the answer. Both figures are toy-workload numbers.
-  **Runnable now.**
+  (`--corpus real_text`) and the pipeline is verified end to end on a fixture,
+  but it has not been pointed at a real corpus with a real checkpoint.
+  *Experiment A1.*
 - **No retrofit has been trained.** `retrofit_parent.py` builds one and proves
-  the parent is preserved to the bit; nothing has trained its exits yet.
-  **Runnable now.**
-- **Sharing tax at shallow tiers.** Needs independently trained models at
-  matched cost. **Blocked on code** — no independent family and no adapter for
-  one (Pythia or similar). This is the single largest remaining gap, and it
-  blocks the paper's central claim.
+  the parent is preserved to the bit; nothing has trained its exits.
+  *Experiment A1.*
+- **`probe-policy gain` is unmeasured on real text.** The go/no-go. On the toy
+  workload the outcome oracle showed +0.051 of headroom while the cross-fitted
+  probe policy attained +0.008, so 85% of the apparent gain required knowing the
+  answer. Both are toy-workload numbers. *Experiment A2.*
+- **Substitution against an independent family.** The Pythia suite is built and
+  verified against real weights — 70m at 1.0107 bits/byte against 160m at 0.9009
+  on identical requests — but no comparison against this backbone has been run.
+  *Experiment A3.* It may prove unreportable: matching the token budget compresses
+  the frontier to 0.016 bits/byte between those two tiers against 0.111 at `main`,
+  and the substitution ratio divides by that.
+
+### No longer pursued
+
+Cut on 2026-07-29. Not blocked — abandoned, with reasons in `DESCRIPTION.md`.
+
+- **The causal sharing tax.** Two arms from one serialized parent under
+  `anchored_v1` would measure it, and `jobs/controlled_arms.sh` is written and
+  validated. Cut because a frozen retrofit pays no sharing tax by construction, so
+  the number would price a method the project is not proposing. Returns only if
+  A1's frozen tiers prove unusable.
+- **Sharing tax at shallow tiers.** Needed independent models at each shallow
+  depth. Out of scope with the family reduced to three tiers.
 - **Latency, throughput, memory and energy on serving hardware.**
-  `benchmark_latency` measures TTFT and TPOT on a laptop toy model and the K/V
-  audit is exact. **Blocked on code** for continuous batching, depth-homogeneous
-  queues, SLO goodput, energy, and counter/profiler parity. TTFT also still comes
-  from a separate invocation rather than instrumented inside one.
-- **Whether token-level routing adds anything.** **Blocked on code**: the gating
-  diagnostic — token-level outcome-oracle gain beyond the request-level cap — is
-  not implemented, and by the roadmap nothing token-level should start until it
-  is.
-- **The K/V propagation strategy has never been trained.**
-  `learned_kv_propagation` defaults to `False` and neither run overrode it.
-  Gated behind request-level routing showing headroom.
+  `benchmark_latency` measures TTFT and TPOT on a laptop toy model. Continuous
+  batching, depth-homogeneous queues, SLO goodput, energy and counter/profiler
+  parity are not built and will not be. The paper states no systems claim beyond
+  the K/V invariant.
+- **Whether token-level routing adds anything.** Its gating diagnostic —
+  token-level outcome-oracle gain beyond the request-level cap — was never built,
+  so the branch is closed rather than pending.
+- **Learned K/V propagation.** `learned_kv_propagation` defaults to `False` and
+  neither run overrode it. Belongs to the token-level branch.
+- **Distribution shift and safety by endpoint.** Separate contribution.
+- **RL or contextual-bandit control.** Never justified before a supervised
+  controller works.
+
+### True regardless
+
 - **Retrofit at scale.** The frozen modes preserve the parent bit-identically in
   tests on a tiny CPU model. The property is structural, so it should hold at
   scale, but it has not been run there.
+- **Scale generally.** No number here comes from a model larger than 124M
+  parameters.
 
 ---
 

@@ -87,10 +87,47 @@ not depend on this default.
 
 ### When the default should flip
 
-`anchored_v1` should become the default once a run has used it end to end on the
-cluster and its endpoint has been compared against a matched final-only arm.
-Until then, new causal arms should pass `--objective_version=anchored_v1`
-explicitly, so the record of every run says which objective produced it.
+The original condition was "once a matched final-only arm has been compared
+against it on the cluster". That comparison was the four Pile scratch arms, **cut
+on 2026-07-29**, so the condition can no longer be met as written.
+
+The replacement: `anchored_v1` should become the default once experiment A1 has
+trained a retrofit's exits with it end to end and the parent's endpoint has been
+verified unchanged. That is a weaker check — it confirms the objective trains
+something usable, not that it beats the legacy weighting on a matched pair — and
+it is the strongest check the narrowed plan supports.
+
+Until then every run should pass `--objective_version=anchored_v1` explicitly, so
+its record says which objective produced it.
+
+---
+
+## Removed: `experiments.build_manifest`
+
+**Status:** deleted 2026-07-29. Recoverable from git history.
+
+It built a horizontal manifest out of the **vertical** model's own trajectories,
+labelling one backbone's depth endpoints as though they were independent models.
+That is the substitution the review prohibited outright: no vertical endpoint data
+may be reused as independent-model data. It existed only because no model family
+was available.
+
+**Replacement:** `experiments.horizontal_family`, which scores real Pythia
+checkpoints and writes a manifest with per-shape costs, a stated quality unit and
+direction, per-request content digests, the revision and token budget of each
+checkpoint, and family metadata recording what is held constant across tiers.
+
+Manifests written by the old module are still *readable* — `load_manifest` accepts
+entries with a scalar `cost` and warns that a matched-cost comparison built on one
+is matched only on average. They will now fail
+`check_units_comparable`, which refuses a manifest that does not state its quality
+unit. That refusal is the point: a manifest of vertical endpoints compared against
+vertical endpoints in an unstated unit is exactly the meaningless comparison the
+guard exists to stop.
+
+`jobs/sharing_tax.sh` was deleted with it — it collected trajectories from real
+checkpoints and pointed them at the synthetic corpus, so its confidence intervals
+were intervals about a token pattern.
 
 ---
 
