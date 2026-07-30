@@ -1,6 +1,0 @@
-[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (1172 > 1024). Running this sequence through the model will result in indexing errors
-'[Errno 9] Bad file descriptor' thrown while requesting GET https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/resolve/87f09149ef4734204d70ed1d046ddc9ca3f2b8f9/sample/10BT/005_00000.parquet
-Retrying in 1s [Retry 1/5].
-Fatal Python error: PyGILState_Release: auto-releasing thread-state, but no thread-state for this thread
-Python runtime state: finalizing (tstate=0x00000000015bcb88)
-
