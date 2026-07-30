@@ -48,7 +48,27 @@ Run in order. Each step can kill the next, which is the point.
 | **2** | `collect_depth_trajectories` → `train_depth_controller` → `evaluate_vertical_routing` | does a controller beat a static mixture | ~1 GPU-hour | `probe-policy gain` ≈ 0 → requests do not differ in the depth they need, and there is nothing to route on |
 | **3** | `jobs/pythia_family.sh` | substitution ratio | one GPU job | frontier too compressed to divide by → report the sharing tax alone, not a ratio |
 
+> **Everything runs on Savio.** The parent checkpoint and the tokenized corpus
+> live in `/global/scratch/users/iparra`, not on a laptop. "Free" above means *no
+> new training budget* — A1 and A2 still need a GPU allocation, just a short one.
+
+```bash
+cd /global/scratch/users/iparra/effortless-dev && git pull
+
+sbatch --job-name=vr-a1 jobs/retrofit.sh      # A1 then A2, ~hours
+sbatch --job-name=pythia jobs/pythia_family.sh step1000   # A3
+```
+
+`jobs/retrofit.sh` takes a stage argument if you want to stop and read between
+steps: `build`, `train`, `route`, or `all` (the default).
+
 ### Step 1
+
+```bash
+sbatch --job-name=vr-a1 jobs/retrofit.sh build
+```
+
+Runs, under the hood:
 
 ```bash
 python -m experiments.retrofit_parent \
@@ -71,6 +91,12 @@ python -m training.train \
 ### Step 2
 
 ```bash
+sbatch --job-name=vr-a2 jobs/retrofit.sh route
+```
+
+Runs, under the hood:
+
+```bash
 python -m experiments.collect_depth_trajectories \
     --corpus real_text --data data/val.bin --eos_id 50256 \
     --checkpoint checkpoints/retrofit-adapter/final.pt \
@@ -91,6 +117,13 @@ at how each depth turned out, which no deployable policy can do.
 
 ```bash
 sbatch --job-name=pythia jobs/pythia_family.sh step1000
+```
+
+Then pass its manifest back into step 2's evaluation:
+
+```bash
+MANIFEST=$SCRATCH_ROOT/results/pythia-step1000/manifest.json \
+    sbatch --job-name=vr-a2b jobs/retrofit.sh route
 ```
 
 `step1000` is Pythia at 2.097B tokens. Not `main` — that is 300B tokens, 120×

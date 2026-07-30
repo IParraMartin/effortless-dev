@@ -76,7 +76,15 @@ mkdir -p "$RESULTS"
 #    separately so the price of compute can change later without recollecting.
 #    Free-running labels cost generation but are the only ones that support a
 #    serving claim, so they are collected rather than skipped.
+# --corpus real_text is mandatory, not defaulted. Without it the collector
+# builds mixed_difficulty_corpus, whose depth structure is a rule the
+# experimenter installed -- so every number downstream would describe a
+# synthetic token pattern while being labelled as a routing result.
 "${PY[@]}" -m experiments.collect_depth_trajectories \
+    --corpus=real_text \
+    --data="${DATA:-$SCRATCH_ROOT/data/val.bin}" \
+    --eos_id="${EOS_ID:-50256}" \
+    --shapes="${SHAPES:-64:32,128:64,256:128}" \
     --checkpoint="$CHECKPOINT" \
     --out="$RESULTS/trajectories" \
     --probe_depth="${PROBE_DEPTH:-2}" \
@@ -90,7 +98,7 @@ mkdir -p "$RESULTS"
 "${PY[@]}" -m experiments.train_depth_controller \
     --trajectories="$RESULTS/trajectories" \
     --out="$RESULTS/controller" \
-    --quality_metric="${QUALITY_METRIC:-teacher_forced_accuracy}" \
+    --quality_metric="${QUALITY_METRIC:-bits_per_byte}" \
     --routing_lambda="${ROUTING_LAMBDA:-0.2}" \
     --seeds 0 1 2
 
