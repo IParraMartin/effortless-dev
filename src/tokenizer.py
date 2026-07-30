@@ -200,12 +200,11 @@ if __name__ == "__main__":
     print(f"logits: {tuple(out.logits.shape)}  loss: {out.loss.item():.4f}")
 
     prompt = tokenizer("The quick brown", return_tensors="pt").input_ids
-    result = model.generate(
+    sequences = model.generate(
         prompt,
         max_new_tokens=12,
         temperature=0.8,
         top_k=50,
         eos_token_id=tokenizer.eos_token_id,
     )
-    print(f"sample: {tokenizer.decode(result.sequences[0])!r}")
-    print(f"mean exit layer: {result.mean_exit_layer:.2f} of {config.n_layers}")
+    print(f"sample: {tokenizer.decode(sequences[0])!r}")

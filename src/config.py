@@ -1,89 +1,31 @@
-"""Configuration dataclasses for the early-exit Transformer.
+"""Configuration for the decoder-only Transformer and its training runs.
 
-Two configurations live here:
+Two dataclasses live here:
 
-    * :class:`TransformerConfig` describes the architecture itself, including
-      where the exit modules sit and how confidently they must predict before a
-      token is allowed to stop.
+    * :class:`TransformerConfig` describes the architecture — width, depth,
+      attention shape, and the pieces of a modern LLM stack that have knobs.
     * :class:`TrainConfig` describes a training run: data, optimization
       schedule, precision, distribution, and checkpointing.
 
-:func:`parse_into` turns either dataclass into a command line interface so a run
-can be reconfigured without editing code.
+:func:`parse_into` turns either dataclass into a command line interface, and
+:func:`parse_configs` parses both from one command line so a run is fully
+specified in a single invocation.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
-from dataclasses import MISSING, dataclass, fields, replace
+from dataclasses import MISSING, dataclass, fields
 from typing import TypeVar
-
-#: Confidence measures accepted by ``exit_criterion``.
-EXIT_CRITERIA = ("entropy", "max_prob", "top2_margin")
-
-#: Schemes accepted by ``exit_loss_weighting``.
-EXIT_WEIGHTINGS = ("linear", "uniform", "final_only")
-
-#: Objectives accepted by ``objective_version``.
-#:
-#: ``legacy_normalized`` is the objective the first two Savio arms trained
-#: under. It normalizes every exit weight to sum to one, so at depths
-#: 2/4/6/8/10/12 the final endpoint receives 12/42 = 0.2857 of the hard-target
-#: coefficient and the shallow exits receive the other 0.7143. That makes the
-#: full endpoint one task among six rather than the protected one, which is why
-#: its degradation in those runs cannot be attributed to parameter sharing.
-#: Retained so those runs stay reproducible.
-#:
-#: ``anchored_v1`` fixes the full-depth coefficient at ``full_loss_weight`` and
-#: normalizes only over the shallow exits, scaling their total by
-#: ``shallow_loss_weight``. The full objective is then never diluted by adding
-#: an exit, and the strength of the auxiliary task is one number that can be
-#: swept.
-OBJECTIVE_VERSIONS = ("legacy_normalized", "anchored_v1")
-
-#: Schedules accepted by ``shallow_loss_schedule``.
-SHALLOW_SCHEDULES = ("constant", "linear_warmup", "cosine_ramp", "alternating")
-
-#: Schemes accepted by ``shallow_weighting``.
-SHALLOW_WEIGHTINGS = ("uniform", "linear", "custom")
-
-#: Estimators accepted by ``shallow_estimator`` when ``exits_per_step`` caps
-#: how many shallow exits a step scores.
-#:
-#: ``unbiased`` scales the sampled exits by ``n_shallow / n_sampled``, so each
-#: exit's expected coefficient over a full rotation equals its weight. This is
-#: the estimator whose averaged gradient matches scoring every exit.
-#:
-#: ``fixed_total`` redistributes the whole shallow weight across whichever exits
-#: were picked, holding the per-step objective scale constant. That is easier on
-#: gradient clipping but biased: an exit that happens to be sampled alongside a
-#: heavy one is systematically down-weighted.
-SHALLOW_ESTIMATORS = ("unbiased", "fixed_total")
-
-#: Teachers accepted by ``distill_teacher``.
-DISTILL_TEACHERS = ("current_full", "frozen_parent")
-
-#: Schemes accepted by ``kv_exposure``.
-KV_EXPOSURES = ("teacher", "simulated")
 
 #: Precisions accepted by ``TrainConfig.dtype``.
 DTYPES = ("bf16", "fp16", "fp32")
 
-#: Routing granularities accepted by ``RoutingConfig.routing_mode``.
-ROUTING_MODES = ("none", "fixed", "request")
-
-#: Prompt pooling schemes accepted by ``RoutingConfig.controller_pooling``.
-CONTROLLER_POOLINGS = ("last", "mean", "last_mean")
-
-#: Controller head types accepted by ``RoutingConfig.controller_output``.
-CONTROLLER_OUTPUTS = ("utility", "ordinal")
-
 
 @dataclass
 class TransformerConfig:
-    """Hyperparameters describing a :class:`Transformer` instance.
+    """Hyperparameters describing a :class:`~src.model.Transformer`.
 
     Attributes:
         vocab_size: Number of distinct tokens in the vocabulary.
@@ -91,140 +33,27 @@ class TransformerConfig:
         n_layers: Number of stacked decoder blocks.
         n_heads: Number of query heads in each attention layer. Must divide
             ``d_model`` evenly.
-        n_kv_heads: Number of key/value heads in each attention layer. Must
-            divide ``n_heads`` evenly. Setting it equal to ``n_heads`` yields
-            standard multi-head attention, ``1`` yields multi-query attention,
-            and any divisor in between yields grouped-query attention.
+        n_kv_heads: Number of key/value heads. Must divide ``n_heads`` evenly.
+            Equal to ``n_heads`` yields standard multi-head attention, ``1``
+            yields multi-query attention, and any divisor in between yields
+            grouped-query attention.
         ff_dim: Inner dimension of the feed-forward network. When ``None`` it
             defaults to the LLaMA heuristic of ``8/3 * d_model`` rounded up to
             the nearest multiple of ``ff_multiple_of``.
         ff_multiple_of: Alignment used when ``ff_dim`` is inferred. Keeping the
             hidden size a multiple of a power of two is friendlier to tensor
             cores.
-        max_seq_len: Longest sequence the rotary embedding tables are built
-            for, and therefore the longest context the model can attend over.
+        max_seq_len: Longest sequence the rotary tables are built for, and
+            therefore the longest context the model can attend over.
         dropout: Dropout probability applied to attention weights and to the
-            output of each sublayer. Modern LLM pretraining typically leaves
-            this at zero.
+            output of each sublayer. Modern LLM pretraining usually leaves this
+            at zero.
         rope_theta: Base period of the rotary embedding. Larger values slow the
             frequency decay and help at long context lengths.
-        norm_eps: Epsilon added to the RMSNorm denominator for numerical
-            stability.
+        norm_eps: Epsilon added to the RMSNorm denominator for stability.
         tie_embeddings: Whether the output projection reuses the input
             embedding matrix.
         init_std: Standard deviation of the normal weight initialization.
-        exit_every: Place an exit module every ``exit_every`` layers. The final
-            layer always carries one, so ``1`` puts an exit on every layer.
-        exit_adapter_rank: Bottleneck width of a zero-initialized residual
-            adapter placed before each exit's readout. ``0`` omits it. Nonzero
-            lets a frozen backbone's intermediate states be remapped nonlinearly
-            without touching a backbone weight, which is what keeps the parent's
-            output exactly unchanged rather than approximately so. Include its
-            inference cost in every endpoint cost.
-        min_exit_layer: Earliest layer index allowed to terminate a token. The
-            first layer or two rarely carry a usable prediction, and letting
-            them fire mostly produces noise.
-        exit_threshold: A token stops as soon as an exit's uncertainty falls
-            below this value. Uncertainty is normalized to ``[0, 1]``, so ``0``
-            disables early exiting entirely and ``1`` exits at the first
-            opportunity.
-        exit_criterion: Which uncertainty measure gates the exit. One of
-            :data:`EXIT_CRITERIA`.
-        exit_loss_weighting: How the per-exit losses are combined. ``"linear"``
-            weights an exit proportionally to its depth, ``"uniform"`` weights
-            every exit equally, and ``"final_only"`` trains just the last exit,
-            which is useful as an ablation.
-        self_distill_weight: Strength of the term pulling each shallow exit
-            toward the final layer's distribution. Set to ``0`` to train the
-            exits on the hard targets alone.
-        self_distill_temperature: Softmax temperature used for the distillation
-            term. Values above one expose more of the teacher's ranking among
-            unlikely tokens.
-        exits_per_step: Number of non-final exits to compute the loss for on
-            each step, sampled fresh each time. ``None`` uses every exit.
-            Lowering it trades gradient coverage for a large memory saving; see
-            the note in :meth:`Transformer.forward`. Under DDP this also
-            requires ``TrainConfig.find_unused_parameters``.
-        full_depth_kv: When ``True``, generation runs every layer even for
-            tokens that already exited, so cached keys and values are exact.
-            This removes the speedup and exists to measure what the state
-            propagation approximation costs.
-        learned_kv_propagation: When ``True``, a small adapter per layer
-            corrects an exited token's hidden state before that layer's
-            key/value projections, instead of reusing it unchanged. The adapter
-            is zero-initialized, so an untrained model reproduces plain
-            propagation exactly.
-        kv_adapter_rank: Bottleneck width of those adapters. The cost is two
-            ``d_model x rank`` matrices per layer, negligible beside a
-            vocabulary-sized output head.
-        kv_propagation_weight: Weight of the auxiliary loss teaching the
-            adapters to reconstruct the hidden state each layer would really
-            have seen.
-        kv_exposure: Which states the adapters are fitted on. ``"teacher"``
-            uses the clean states of a full-depth pass, which is cheap but is
-            not what inference produces. ``"simulated"`` runs an extra
-            early-exit forward so the adapters see their own deployment
-            distribution, at the cost of roughly one more backbone pass per
-            step.
-        refresh_every: During generation, force a full-depth token every this
-            many steps, re-anchoring the residual stream and writing exact keys
-            and values at that position. ``0`` disables it. Intended as a
-            mitigation for drift accumulating over long generations.
-        objective_version: Which multi-exit objective to optimize. One of
-            :data:`OBJECTIVE_VERSIONS`. The default reproduces the runs already
-            on disk; ``"anchored_v1"`` is the objective new causal arms should
-            use. The fields below from ``full_loss_weight`` through
-            ``preservation_teacher_checkpoint`` apply only to ``anchored_v1``
-            and are ignored by the legacy objective, which reads
-            ``exit_loss_weighting``, ``self_distill_weight`` and
-            ``self_distill_temperature`` instead.
-        full_loss_weight: Coefficient of the full-depth cross-entropy. Held at
-            one by default and never renormalized when exits are added, which
-            is the whole point of the anchored form.
-        shallow_loss_weight: Total strength of the shallow objective, the
-            ``alpha`` of the anchored loss. ``0`` reproduces a final-only run
-            exactly, which makes it the natural control arm.
-        shallow_loss_schedule: How ``shallow_loss_weight`` varies with the step.
-            One of :data:`SHALLOW_SCHEDULES`. ``"linear_warmup"`` and
-            ``"cosine_ramp"`` reach the full value at
-            ``shallow_loss_warmup_steps``, letting the representation form
-            around the full task first. ``"alternating"`` applies the shallow
-            term on odd steps only, which halves how often shallow gradients
-            reach the backbone and lowers peak memory.
-        shallow_loss_warmup_steps: Steps the ramping schedules take to reach
-            ``shallow_loss_weight``.
-        shallow_weighting: How the shallow total is split across depths. One of
-            :data:`SHALLOW_WEIGHTINGS`. Normalized over shallow exits only.
-        shallow_custom_weights: Explicit depth-to-weight mapping used when
-            ``shallow_weighting`` is ``"custom"``. Keys are depths — executed
-            block counts, so ``layer_index + 1`` — and must cover every shallow
-            exit exactly. Normalized internally, so the values need only be
-            proportional.
-        shallow_estimator: How a capped step stands in for the exits it did not
-            score. One of :data:`SHALLOW_ESTIMATORS`.
-        distill_weight: Strength of the distillation term inside each shallow
-            exit's loss, the ``beta`` of the anchored loss.
-        distill_temperature: Softmax temperature for that term. The loss is
-            multiplied by its square, the usual convention that keeps the
-            gradient scale comparable to the cross-entropy as the temperature
-            changes.
-        distill_teacher: Which distribution the shallow exits imitate. One of
-            :data:`DISTILL_TEACHERS`. ``"current_full"`` uses this model's own
-            detached final layer. ``"frozen_parent"`` uses the reference
-            attached by :meth:`Transformer.attach_parent`, which is the right
-            choice for a retrofit: the target does not move as the retrofit
-            proceeds.
-        distill_top_k: Restrict the distillation term to the teacher's top-k
-            tokens, with the remaining mass pooled into one bucket. ``None``
-            uses the whole vocabulary. Cheaper at large vocabularies, and an
-            approximation that must be reported as one.
-        preservation_weight: Strength of the term holding this model's
-            full-depth distribution near the attached parent's. Zero disables
-            it. Nonzero requires a parent reference, since there is otherwise
-            nothing to preserve against.
-        preservation_teacher_checkpoint: Path recorded for provenance so a run
-            states which parent it preserved against. Loading is the caller's
-            job; the model only holds the reference.
     """
 
     vocab_size: int = 52_000
@@ -241,44 +70,12 @@ class TransformerConfig:
     tie_embeddings: bool = True
     init_std: float = 0.02
 
-    exit_every: int = 1
-    exit_adapter_rank: int = 0
-    min_exit_layer: int = 1
-    exit_threshold: float = 0.3
-    exit_criterion: str = "entropy"
-    exit_loss_weighting: str = "linear"
-    self_distill_weight: float = 0.5
-    self_distill_temperature: float = 2.0
-    exits_per_step: int | None = None
-    full_depth_kv: bool = False
-    learned_kv_propagation: bool = False
-    kv_adapter_rank: int = 32
-    kv_propagation_weight: float = 1.0
-    kv_exposure: str = "teacher"
-    refresh_every: int = 0
-
-    objective_version: str = "legacy_normalized"
-    full_loss_weight: float = 1.0
-    shallow_loss_weight: float = 0.0
-    shallow_loss_schedule: str = "constant"
-    shallow_loss_warmup_steps: int = 0
-    shallow_weighting: str = "linear"
-    shallow_custom_weights: dict[int, float] | None = None
-    shallow_estimator: str = "unbiased"
-    distill_weight: float = 0.0
-    distill_temperature: float = 2.0
-    distill_teacher: str = "current_full"
-    distill_top_k: int | None = None
-    preservation_weight: float = 0.0
-    preservation_teacher_checkpoint: str | None = None
-
     def __post_init__(self) -> None:
         """Fills in derived fields and validates the configuration.
 
         Raises:
-            ValueError: If any field is outside its permitted range, if
-                ``d_model`` is not divisible by ``n_heads``, or if ``n_heads``
-                is not divisible by ``n_kv_heads``.
+            ValueError: If ``d_model`` is not divisible by ``n_heads``, or if
+                ``n_heads`` is not divisible by ``n_kv_heads``.
         """
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
@@ -300,504 +97,33 @@ class TransformerConfig:
                 hidden / self.ff_multiple_of
             )
 
-        if self.exit_every < 1:
-            raise ValueError(f"exit_every must be positive, got {self.exit_every}.")
-        if self.exit_adapter_rank < 0:
-            raise ValueError(
-                "exit_adapter_rank must be non-negative, got "
-                f"{self.exit_adapter_rank}."
-            )
-        if not 0 <= self.min_exit_layer < self.n_layers:
-            raise ValueError(
-                f"min_exit_layer must lie in [0, n_layers), got "
-                f"{self.min_exit_layer} for n_layers={self.n_layers}."
-            )
-        if not 0.0 <= self.exit_threshold <= 1.0:
-            raise ValueError(
-                f"exit_threshold must lie in [0, 1], got {self.exit_threshold}."
-            )
-        if self.exit_criterion not in EXIT_CRITERIA:
-            raise ValueError(
-                f"exit_criterion must be one of {EXIT_CRITERIA}, got "
-                f"{self.exit_criterion!r}."
-            )
-        if self.exit_loss_weighting not in EXIT_WEIGHTINGS:
-            raise ValueError(
-                f"exit_loss_weighting must be one of {EXIT_WEIGHTINGS}, got "
-                f"{self.exit_loss_weighting!r}."
-            )
-        if self.self_distill_weight < 0.0:
-            raise ValueError(
-                "self_distill_weight must be non-negative, got "
-                f"{self.self_distill_weight}."
-            )
-        if self.self_distill_temperature <= 0.0:
-            raise ValueError(
-                "self_distill_temperature must be positive, got "
-                f"{self.self_distill_temperature}."
-            )
-        if self.kv_exposure not in KV_EXPOSURES:
-            raise ValueError(
-                f"kv_exposure must be one of {KV_EXPOSURES}, got "
-                f"{self.kv_exposure!r}."
-            )
-        if self.exits_per_step is not None and self.exits_per_step < 1:
-            raise ValueError(
-                f"exits_per_step must be positive or None, got "
-                f"{self.exits_per_step}."
-            )
-
-        self._validate_objective()
-
-    def _validate_objective(self) -> None:
-        """Checks the anchored objective's fields.
-
-        Raises:
-            ValueError: If a name is unrecognized, a weight is negative, a
-                temperature is not positive, the custom weights do not cover
-                exactly the shallow depths or do not sum to something positive,
-                or preservation is requested without a checkpoint to record.
-        """
-        for name, allowed in (
-            ("objective_version", OBJECTIVE_VERSIONS),
-            ("shallow_loss_schedule", SHALLOW_SCHEDULES),
-            ("shallow_weighting", SHALLOW_WEIGHTINGS),
-            ("shallow_estimator", SHALLOW_ESTIMATORS),
-            ("distill_teacher", DISTILL_TEACHERS),
-        ):
-            value = getattr(self, name)
-            if value not in allowed:
-                raise ValueError(
-                    f"{name} must be one of {allowed}, got {value!r}."
-                )
-
-        for name in ("full_loss_weight", "shallow_loss_weight", "distill_weight",
-                     "preservation_weight"):
-            value = getattr(self, name)
-            if value < 0.0:
-                raise ValueError(f"{name} must be non-negative, got {value}.")
-
-        if self.distill_temperature <= 0.0:
-            raise ValueError(
-                f"distill_temperature must be positive, got "
-                f"{self.distill_temperature}."
-            )
-        if self.shallow_loss_warmup_steps < 0:
-            raise ValueError(
-                "shallow_loss_warmup_steps must be non-negative, got "
-                f"{self.shallow_loss_warmup_steps}."
-            )
-        if self.shallow_loss_schedule in ("linear_warmup", "cosine_ramp") and (
-            self.shallow_loss_warmup_steps == 0
-        ):
-            raise ValueError(
-                f"shallow_loss_schedule={self.shallow_loss_schedule!r} needs "
-                f"shallow_loss_warmup_steps > 0; with zero it is indistinguishable "
-                f"from 'constant', and a run whose schedule is a no-op should say "
-                f"'constant' so its record is readable."
-            )
-        if self.distill_top_k is not None and self.distill_top_k < 1:
-            raise ValueError(
-                f"distill_top_k must be positive or None, got {self.distill_top_k}."
-            )
-
-        if self.shallow_weighting == "custom":
-            self._validate_custom_weights()
-        elif self.shallow_custom_weights is not None:
-            raise ValueError(
-                "shallow_custom_weights was supplied but shallow_weighting is "
-                f"{self.shallow_weighting!r}. Set shallow_weighting='custom' to use "
-                f"them, rather than having them silently ignored."
-            )
-
-    def _validate_custom_weights(self) -> None:
-        """Checks that custom shallow weights cover exactly the shallow depths.
-
-        Raises:
-            ValueError: If the mapping is absent, misses a shallow depth, names
-                a depth that carries no exit, contains a negative value, or sums
-                to zero.
-        """
-        if not self.shallow_custom_weights:
-            raise ValueError(
-                "shallow_weighting='custom' requires shallow_custom_weights, "
-                "a mapping from depth to weight."
-            )
-
-        # Keys may arrive as strings from JSON or a command line.
-        supplied = {int(depth): float(w) for depth, w in
-                    self.shallow_custom_weights.items()}
-        self.shallow_custom_weights = supplied
-
-        expected = {layer + 1 for layer in self.exit_layers[:-1]}
-        if set(supplied) != expected:
-            raise ValueError(
-                f"shallow_custom_weights must name exactly the shallow depths "
-                f"{sorted(expected)}, got {sorted(supplied)}. A depth left out "
-                f"would be trained at weight zero without saying so, and a depth "
-                f"named that carries no exit would be silently dropped."
-            )
-        negative = {d: w for d, w in supplied.items() if w < 0.0}
-        if negative:
-            raise ValueError(
-                f"shallow_custom_weights must be non-negative, got {negative}."
-            )
-        if sum(supplied.values()) <= 0.0:
-            raise ValueError(
-                "shallow_custom_weights must sum to something positive; all "
-                "zeros should be expressed as shallow_loss_weight=0.0."
-            )
-
     @property
     def head_dim(self) -> int:
         """Dimensionality of a single attention head."""
         return self.d_model // self.n_heads
 
-    @property
-    def exit_layers(self) -> tuple[int, ...]:
-        """Indices of the layers that carry an exit module.
-
-        The final layer is always included, since it is the model's ordinary
-        output head and every token that never gained confidence falls through
-        to it.
-
-        Returns:
-            Ascending layer indices, always ending with ``n_layers - 1``.
-        """
-        layers = {
-            layer
-            for layer in range(self.n_layers)
-            if (layer + 1) % self.exit_every == 0
-        }
-        layers.add(self.n_layers - 1)
-        return tuple(sorted(layers))
-
-    @property
-    def exit_depths(self) -> tuple[int, ...]:
-        """Executed depths that carry an exit module.
-
-        The same exits as :attr:`exit_layers`, counted as blocks run rather
-        than as zero-based indices. Request-level routing is expressed in
-        depths throughout, because that is what compute and cache memory are
-        proportional to, so this is the form its candidate tiers take.
-
-        Returns:
-            Ascending depths in ``[1, n_layers]``, always ending at
-            ``n_layers``.
-        """
-        return tuple(layer + 1 for layer in self.exit_layers)
-
-    @property
-    def exit_weights(self) -> tuple[float, ...]:
-        """Normalized weight of each exit in the training objective.
-
-        Deeper exits are more accurate, so under the default ``"linear"``
-        scheme they carry proportionally more of the loss. The weights sum to
-        one so that the total loss stays comparable to a single-exit model's.
-
-        Returns:
-            One weight per entry of :attr:`exit_layers`, summing to ``1.0``.
-        """
-        layers = self.exit_layers
-        if self.exit_loss_weighting == "uniform":
-            raw = [1.0] * len(layers)
-        elif self.exit_loss_weighting == "linear":
-            raw = [float(layer + 1) for layer in layers]
-        else:  # "final_only"
-            raw = [0.0] * len(layers)
-            raw[-1] = 1.0
-
-        total = sum(raw)
-        return tuple(value / total for value in raw)
-
-    @property
-    def shallow_weights(self) -> tuple[float, ...]:
-        """Anchored shallow weights, normalized over the shallow exits alone.
-
-        This is the difference the anchored objective turns on. The legacy
-        :attr:`exit_weights` normalizes across *all* exits, so adding a shallow
-        exit takes coefficient away from the final one: at depths 2/4/6/8/10/12
-        the final endpoint keeps 0.2857 of the hard-target weight. Here the
-        final entry is zero — its coefficient is :attr:`full_loss_weight`,
-        applied separately and never divided — and the shallow entries sum to
-        one, so ``shallow_loss_weight`` alone controls how loud the auxiliary
-        task is.
-
-        Returns:
-            One weight per entry of :attr:`exit_layers`, ending in ``0.0``, with
-            the remaining entries summing to ``1.0``. A model with a single exit
-            has no shallow exits and returns ``(0.0,)``.
-        """
-        layers = self.exit_layers
-        shallow = layers[:-1]
-        if not shallow:
-            return (0.0,)
-
-        if self.shallow_weighting == "uniform":
-            raw = [1.0] * len(shallow)
-        elif self.shallow_weighting == "linear":
-            raw = [float(layer + 1) for layer in shallow]
-        else:  # "custom", validated to cover exactly these depths
-            raw = [float(self.shallow_custom_weights[layer + 1]) for layer in shallow]
-
-        total = sum(raw)
-        return tuple([value / total for value in raw] + [0.0])
-
-    def shallow_alpha(self, step: int) -> float:
-        """Strength of the shallow objective at a given optimizer step.
-
-        Args:
-            step: Zero-based step index.
-
-        Returns:
-            The coefficient multiplying the normalized shallow sum. ``constant``
-            ignores the step. ``linear_warmup`` and ``cosine_ramp`` rise from
-            zero to :attr:`shallow_loss_weight` over
-            :attr:`shallow_loss_warmup_steps`, so the representation forms
-            around the full task before intermediate decodability is demanded.
-            ``alternating`` returns the full weight on odd steps and zero on
-            even ones, which preserves genuinely full-objective updates and
-            lowers peak memory because shallow logits are not materialized every
-            step.
-        """
-        target = self.shallow_loss_weight
-        if target == 0.0 or self.shallow_loss_schedule == "constant":
-            return target
-        if self.shallow_loss_schedule == "alternating":
-            return target if step % 2 == 1 else 0.0
-
-        span = max(self.shallow_loss_warmup_steps, 1)
-        progress = min(max(step, 0) / span, 1.0)
-        if self.shallow_loss_schedule == "linear_warmup":
-            return target * progress
-        # cosine_ramp: slower at the start, so the first shallow gradients
-        # arrive gently rather than as a step change.
-        return target * 0.5 * (1.0 - math.cos(math.pi * progress))
-
 
 @dataclass
-class RoutingConfig:
-    """How much of the backbone a request is allowed to execute.
+class Seeds:
+    """The random streams a training run consumes.
 
-    This describes *vertical routing*: one depth chosen per request, before
-    generation starts, from a cheap probe of the prompt. It is a different
-    mechanism from the per-token early exiting configured on
-    :class:`TransformerConfig`, and the two are deliberately separable — token
-    routing revisits the decision every step and keeps a full-depth cache,
-    while request routing decides once and never materializes upper layers at
-    all, which is where the memory saving comes from.
-
-    The defaults leave routing off, so an unrouted model behaves exactly as it
-    did before this existed.
+    Kept separate so that changing one does not move the others. Streams left
+    unset are derived from a single base seed, so the common case stays one
+    number while any stream remains independently settable.
 
     Attributes:
-        routing_mode: ``"none"`` runs the full stack, ``"fixed"`` runs every
-            request to :attr:`fixed_depth`, and ``"request"`` lets the
-            controller choose per request.
-        depth_tiers: Candidate depths, counted as executed blocks. ``None``
-            derives them from the model's exit modules. Full depth must be
-            reachable, because it is the fallback when routing fails.
-        probe_depth: Blocks run before the routing decision. Their output is
-            the controller's input, and their cost is paid by every request, so
-            this trades decision quality against a floor on cost.
-        fixed_depth: Depth used when ``routing_mode`` is ``"fixed"``.
-        controller_hidden: Bottleneck width of the controller.
-        controller_pooling: How prompt positions are reduced to one feature
-            vector. One of :data:`CONTROLLER_POOLINGS`.
-        controller_output: ``"utility"`` predicts quality at every tier and
-            picks the best trade against cost, which lets ``routing_lambda``
-            change at inference without retraining. ``"ordinal"`` predicts the
-            probability that each tier is already sufficient, which is easier
-            to calibrate but is tied to one operating point.
-        controller_use_length: Whether normalized prompt length joins the
-            pooled features.
-        controller_path: Checkpoint to load controller weights from. Without
-            one the controller is untrained, and routing is only as meaningful
-            as its initialization.
-        routing_lambda: Price of compute in the utility rule, in quality units
-            per unit of normalized cost. Zero always chooses the deepest tier,
-            which is the safe default.
-        sufficiency_threshold: Probability at which the ordinal head calls a
-            tier sufficient.
-        min_depth: Shallowest depth the controller may choose. ``None`` uses
-            the shallowest tier.
-        safety_depth: Floor applied after the controller has chosen, for
-            behaviour that shallow endpoints may simply not implement.
-            Separate from ``min_depth`` so a safety floor is visible as such
-            rather than hidden in the candidate set.
-        deterministic_routing: Whether evaluation takes the argmax rather than
-            sampling. Sampled routing exists for exploration during data
-            collection, never for reporting.
-        retain_boundary_state: Whether to keep the boundary activation for
-            every prompt position so a request can later be escalated through
-            upper blocks without recomputing the lower ones. Costs
-            ``batch * prompt_len * d_model``.
+        model_init: Parameter initialization. Deliberately *not* offset by rank,
+            so a single-process run and rank zero of a distributed one start
+            from identical weights.
+        data_order: Which blocks each rank reads, in which order. The per-rank
+            offset lives in the sampler's position formula, not in this seed.
+        dropout: Stochastic regularization. Offset by rank at the call site, so
+            ranks do not apply identical masks.
     """
 
-    routing_mode: str = "none"
-    depth_tiers: tuple[int, ...] | None = None
-    probe_depth: int = 1
-    fixed_depth: int | None = None
-
-    controller_hidden: int = 64
-    controller_pooling: str = "last_mean"
-    controller_output: str = "utility"
-    controller_use_length: bool = True
-    controller_path: str | None = None
-
-    routing_lambda: float = 0.0
-    sufficiency_threshold: float = 0.5
-    min_depth: int | None = None
-    safety_depth: int | None = None
-    deterministic_routing: bool = True
-    retain_boundary_state: bool = False
-
-    def __post_init__(self) -> None:
-        """Validates the fields that do not depend on a model.
-
-        Raises:
-            ValueError: If an enumerated field has an unrecognized value or a
-                numeric field is out of range.
-        """
-        if self.routing_mode not in ROUTING_MODES:
-            raise ValueError(
-                f"routing_mode must be one of {ROUTING_MODES}, got "
-                f"{self.routing_mode!r}."
-            )
-        if self.controller_pooling not in CONTROLLER_POOLINGS:
-            raise ValueError(
-                f"controller_pooling must be one of {CONTROLLER_POOLINGS}, got "
-                f"{self.controller_pooling!r}."
-            )
-        if self.controller_output not in CONTROLLER_OUTPUTS:
-            raise ValueError(
-                f"controller_output must be one of {CONTROLLER_OUTPUTS}, got "
-                f"{self.controller_output!r}."
-            )
-        if self.controller_hidden < 1:
-            raise ValueError(
-                f"controller_hidden must be positive, got {self.controller_hidden}."
-            )
-        if self.routing_lambda < 0.0:
-            raise ValueError(
-                f"routing_lambda must be non-negative, got {self.routing_lambda}."
-            )
-        if not 0.0 <= self.sufficiency_threshold <= 1.0:
-            raise ValueError(
-                "sufficiency_threshold must lie in [0, 1], got "
-                f"{self.sufficiency_threshold}."
-            )
-        if self.depth_tiers is not None:
-            self.depth_tiers = tuple(int(tier) for tier in self.depth_tiers)
-
-    def resolve(self, model: TransformerConfig) -> RoutingConfig:
-        """Fills in the model-dependent fields and checks the combination.
-
-        Validation happens here rather than in ``__post_init__`` because
-        almost every rule refers to the model: which depths carry an exit
-        module, how deep the stack is, and whether the probe fits underneath
-        the shallowest tier. A routing configuration is only well formed
-        relative to a backbone.
-
-        Args:
-            model: The architecture routing will run on.
-
-        Returns:
-            A new configuration with :attr:`depth_tiers`, :attr:`min_depth`,
-            and :attr:`fixed_depth` filled in. The original is unchanged.
-
-        Raises:
-            ValueError: If the tiers are unsorted, duplicated, out of range, or
-                land on a depth with no exit module; if full depth is
-                unreachable; if the probe is deeper than the shallowest
-                selectable tier; or if a fixed-depth run names no depth.
-        """
-        available = model.exit_depths
-        tiers = tuple(self.depth_tiers) if self.depth_tiers else available
-
-        if not tiers:
-            raise ValueError("depth_tiers resolved to an empty set.")
-
-        if len(set(tiers)) != len(tiers):
-            raise ValueError(f"depth_tiers must be unique, got {tiers}.")
-        if list(tiers) != sorted(tiers):
-            raise ValueError(
-                f"depth_tiers must be ascending, got {tiers}. Order carries "
-                f"meaning: the controller's outputs are indexed by tier."
-            )
-
-        out_of_range = [t for t in tiers if not 1 <= t <= model.n_layers]
-        if out_of_range:
-            raise ValueError(
-                f"depth_tiers {out_of_range} lie outside [1, {model.n_layers}]. "
-                f"Tiers count executed blocks, not layer indices, so full "
-                f"depth is {model.n_layers}."
-            )
-
-        missing = [t for t in tiers if t not in available]
-        if missing:
-            raise ValueError(
-                f"No exit module sits at depths {missing}. Exits are at "
-                f"{available}; either choose tiers from those, or rebuild the "
-                f"model with an exit_every that covers the depths you want."
-            )
-
-        if model.n_layers not in tiers:
-            raise ValueError(
-                f"Full depth ({model.n_layers}) must be among depth_tiers, "
-                f"since it is the fallback when the controller declines to "
-                f"route. Got {tiers}."
-            )
-
-        floor = tiers[0] if self.min_depth is None else int(self.min_depth)
-        if floor not in tiers:
-            raise ValueError(
-                f"min_depth {floor} is not one of the tiers {tiers}."
-            )
-
-        selectable = tuple(t for t in tiers if t >= floor)
-        if self.probe_depth < 1 or self.probe_depth > selectable[0]:
-            raise ValueError(
-                f"probe_depth must lie in [1, {selectable[0]}], got "
-                f"{self.probe_depth}. The probe runs before the decision, so a "
-                f"probe deeper than the shallowest selectable tier "
-                f"({selectable[0]}) would have already spent more than that "
-                f"tier costs."
-            )
-
-        if self.safety_depth is not None:
-            if self.safety_depth not in tiers:
-                raise ValueError(
-                    f"safety_depth {self.safety_depth} is not one of the tiers "
-                    f"{tiers}."
-                )
-
-        fixed = self.fixed_depth
-        if self.routing_mode == "fixed":
-            if fixed is None:
-                fixed = model.n_layers
-            if fixed not in tiers:
-                raise ValueError(
-                    f"fixed_depth {fixed} is not one of the tiers {tiers}."
-                )
-
-        return replace(
-            self, depth_tiers=tiers, min_depth=floor, fixed_depth=fixed
-        )
-
-    @property
-    def selectable_tiers(self) -> tuple[int, ...]:
-        """Tiers the controller may actually choose, after the floor.
-
-        Raises:
-            ValueError: If called before :meth:`resolve`.
-        """
-        if self.depth_tiers is None:
-            raise ValueError(
-                "depth_tiers are unresolved; call resolve(model_config) first."
-            )
-        floor = self.min_depth or self.depth_tiers[0]
-        return tuple(tier for tier in self.depth_tiers if tier >= floor)
+    model_init: int
+    data_order: int
+    dropout: int
 
 
 @dataclass
@@ -805,28 +131,22 @@ class TrainConfig:
     """Settings for a training run.
 
     Attributes:
-        dataset_name: Hugging Face dataset repository id.
+        dataset_name: Hugging Face dataset repository id, or a path to a local
+            data file (``.jsonl``/``.parquet``/``.csv``/``.txt``).
         dataset_config: Configuration name within that dataset.
-        text_column: Column holding the raw text. Conventions vary by corpus:
-            ``"text"`` for most, ``"content"`` for code, ``"story"`` for
-            TinyStories.
+        text_column: Column holding the raw text. Conventions vary: ``"text"``
+            for most, ``"content"`` for code, ``"story"`` for TinyStories.
         streaming: Read the corpus as a stream instead of downloading it whole.
-            Required for anything that will not fit on disk, and the reason
-            preparation writes incrementally rather than buffering.
+            Required for corpora that will not fit on disk.
         tokenizer_name: Tokenizer to encode the corpus with. The model's
             vocabulary size is derived from it.
         data_dir: Directory holding the tokenized ``train.bin``/``val.bin``
-            memory maps produced by ``data.py``.
+            memory maps produced by ``training/data.py``.
         seq_len: Tokens per training example.
-        max_train_docs: Cap on documents tokenized during preparation, useful
-            for quick experiments. ``None`` uses the whole split. Also decides
-            where a held-out set is carved from when the corpus ships only a
-            training split: validation is taken from beyond the cap, so the
-            two never overlap.
-        overwrite_data: Re-tokenize splits that are already complete on disk.
-            Preparation is skipped by default for any split whose sidecar
-            matches the current settings, so a job that dies partway can be
-            resubmitted without repeating hours of work.
+        max_train_docs: Cap on documents tokenized during preparation. ``None``
+            uses the whole split. Also decides where a held-out set is carved
+            from when the corpus ships only a training split.
+        overwrite_data: Re-tokenize splits already complete on disk.
         batch_size: Examples per micro-batch, per device.
         grad_accum_steps: Micro-batches accumulated before each optimizer step.
             The global batch is ``batch_size * grad_accum_steps * world_size``.
@@ -841,45 +161,19 @@ class TrainConfig:
             ``0.999`` adapts too slowly for the loss spikes seen early on.
         dtype: Autocast precision, one of :data:`DTYPES`.
         compile_model: Whether to wrap the model in :func:`torch.compile`.
-        seed: Base seed. Every stream below is derived from it when left unset,
-            so a run is still specified by one number, but the streams are
-            separate so that changing one does not move the others.
-        model_init_seed: Parameter initialization. Deliberately *not* offset by
-            rank: two arms meant to branch from a common parent cannot do so if
-            their constructors consumed different random streams.
-        data_order_seed: Which blocks each rank reads, in which order. The rank
-            offset lives in the sampler's position formula rather than in this
-            seed, so ranks read disjoint data by construction.
-        dropout_seed: Stochastic regularization. Offset by rank on purpose, so
-            ranks do not apply identical masks.
-        exit_sampling_seed: Which exits a capped step scores. Must be identical
-            across ranks or gradients diverge silently.
+        seed: Base seed. Every stream in :class:`Seeds` is derived from it when
+            left unset, so a run is still specified by one number.
+        model_init_seed: Override for the initialization stream.
+        data_order_seed: Override for the data-order stream.
+        dropout_seed: Override for the dropout stream.
         num_workers: Dataloader worker processes per rank.
         ddp_backend: Collective backend. ``"nccl"`` on CUDA, ``"gloo"``
             otherwise; ``"auto"`` picks based on device availability.
-        find_unused_parameters: Required when ``exits_per_step`` is set, since
-            unsampled exit modules receive no gradient on that step.
         out_dir: Directory checkpoints are written to.
         save_every: Steps between checkpoints.
         resume_from: Checkpoint path to restore model, optimizer, and step from.
-        init_from: Serialized *initialization* to branch from, before any
-            training. Distinct from ``resume_from``: it carries weights only, at
-            step zero, so two arms that differ in objective still provably start
-            from the same parameters. Matching seeds is not the same guarantee —
-            any change to construction order moves the stream, and the two arms
-            of a causal comparison are exactly the runs whose construction
-            differs.
-        save_init_to: Write the initialization here before training starts, then
-            continue. Run once to mint the common parent that every arm of a
-            comparison branches from.
         eval_every: Steps between validation passes.
         eval_steps: Validation batches per pass.
-        sweep_every: Steps between exit-threshold sweeps. ``0`` disables them.
-        grad_diagnostics_every: Steps between gradient-conflict diagnostics.
-            ``0``, the default, disables them. Each one costs an extra forward
-            and two backward passes with every exit scored, so it is a periodic
-            probe rather than per-step instrumentation. Its purpose is to decide
-            whether gradient-surgery machinery is warranted before adding any.
         log_every: Steps between training log lines.
         wandb_project: Weights & Biases project to log to. Leaving this unset
             disables tracking entirely, and the ``wandb`` package is then not
@@ -918,21 +212,15 @@ class TrainConfig:
     model_init_seed: int | None = None
     data_order_seed: int | None = None
     dropout_seed: int | None = None
-    exit_sampling_seed: int | None = None
     num_workers: int = 2
 
     ddp_backend: str = "auto"
-    find_unused_parameters: bool = False
 
     out_dir: str = "checkpoints"
     save_every: int = 1000
     resume_from: str | None = None
-    init_from: str | None = None
-    save_init_to: str | None = None
     eval_every: int = 500
     eval_steps: int = 50
-    sweep_every: int = 2000
-    grad_diagnostics_every: int = 0
     log_every: int = 10
 
     wandb_project: str | None = None
@@ -974,26 +262,23 @@ class TrainConfig:
         if self.grad_clip < 0:
             raise ValueError(f"grad_clip must be non-negative, got {self.grad_clip}.")
 
-    def seeds(self):
+    def seeds(self) -> Seeds:
         """Resolves the named random streams this run consumes.
 
-        Returns:
-            A :class:`utils.provenance.Seeds` instance. Streams left unset on
-            the command line are derived from :attr:`seed`, so the common case
-            stays a single number while any stream remains independently
-            settable.
-        """
-        # Imported here rather than at module scope: config.py is imported by
-        # everything, and provenance pulls in subprocess and importlib.metadata
-        # for facts that only a run needs.
-        from utils.provenance import Seeds
+        Streams left unset on the command line are derived from :attr:`seed`
+        with a small fixed offset, so the streams stay distinct while the run is
+        still specified by one number.
 
-        return Seeds.resolve(
-            self.seed,
-            model_init=self.model_init_seed,
-            data_order=self.data_order_seed,
-            dropout=self.dropout_seed,
-            exit_sampling=self.exit_sampling_seed,
+        Returns:
+            The resolved :class:`Seeds`.
+        """
+        return Seeds(
+            model_init=self.seed if self.model_init_seed is None
+            else self.model_init_seed,
+            data_order=self.seed + 1 if self.data_order_seed is None
+            else self.data_order_seed,
+            dropout=self.seed + 2 if self.dropout_seed is None
+            else self.dropout_seed,
         )
 
 
@@ -1021,16 +306,6 @@ def _add_field_argument(parser: argparse.ArgumentParser, name: str, kind: object
             type=lambda value: value.lower() in ("1", "true", "yes"),
             default=default,
             metavar="BOOL",
-        )
-    elif "dict" in annotation:
-        # JSON, so a mapping is expressible on one command line and lands in the
-        # run record in the same form it was typed:
-        #   --shallow_custom_weights='{"2": 1, "4": 2}'
-        parser.add_argument(
-            flag,
-            type=lambda value: None if value.lower() == "none" else json.loads(value),
-            default=default,
-            metavar="JSON",
         )
     elif "int" in annotation:
         parser.add_argument(
@@ -1091,17 +366,17 @@ def parse_configs(
     Both dataclasses contribute flags to a single parser, so a run can be sized
     and scheduled in one invocation::
 
-        python train.py --n_layers=6 --d_model=384 --exit_every=2 --max_steps=5000
+        python -m training.train --n_layers=6 --d_model=384 --max_steps=5000
 
     Args:
         argv: Argument list to parse. Defaults to ``sys.argv[1:]``.
 
     Returns:
         A tuple ``(train_config, model_overrides)``. The second element is
-        ready to splat into :func:`tokenizer.config_from_tokenizer`, which
+        ready to splat into :func:`src.tokenizer.config_from_tokenizer`, which
         supplies the vocabulary size itself.
     """
-    parser = argparse.ArgumentParser(description="Train an early-exit Transformer.")
+    parser = argparse.ArgumentParser(description="Train a decoder-only Transformer.")
 
     train_names, model_names = [], []
     for cls, names in ((TrainConfig, train_names), (TransformerConfig, model_names)):

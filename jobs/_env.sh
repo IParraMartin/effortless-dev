@@ -1,29 +1,15 @@
 #!/bin/bash
-# Shared environment for every Savio job in this directory. Sourced, not run.
+# Shared environment for the Savio jobs in this directory. Sourced, not run.
 #
-# Home is a 10 GB quota. uv's package cache, uv's managed interpreters, the
-# Hugging Face cache and Weights & Biases run data all default to home and all
-# of them will fill it, so each is redirected to scratch.
-#
-# Weights & Biases logs **online**: Savio compute nodes do reach the service,
-# confirmed on this account. WANDB_CONFIG_DIR is deliberately *not* redirected —
-# it is a small settings file, and moving it risks disturbing a `wandb login`
-# that already works, which is not a trade worth making to save kilobytes. The
-# credentials themselves live in ~/.netrc and are untouched either way.
-#
-# WANDB_MODE=offline remains available and jobs/sync_wandb.sh pushes afterwards.
-# Worth reaching for if a node turns out to be firewalled or the service is
-# unreachable mid-run; offline recording cannot fail, it just defers.
-
-# Not `set -e` here: this file is sourced, and killing the caller's shell on a
-# non-zero probe would be surprising.
+# Home is a 10 GB quota, so uv's caches, the Hugging Face cache and Weights &
+# Biases run data are all redirected to scratch. Not `set -e`: this file is
+# sourced, and a non-zero probe should not kill the caller's shell.
 set -uo pipefail
 
 SCRATCH_ROOT="${SCRATCH_ROOT:-/global/scratch/users/iparra}"
 REPO_DIR="${REPO_DIR:-$SCRATCH_ROOT/effortless-dev}"
 
-# uv installs to ~/.local/bin, which a non-interactive batch shell will not have
-# on its PATH.
+# uv installs to ~/.local/bin, which a non-interactive batch shell lacks on PATH.
 export PATH="$HOME/.local/bin:$PATH"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$SCRATCH_ROOT/.cache/uv}"
@@ -31,31 +17,13 @@ export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$SCRATCH_ROOT/.local/uv-p
 export HF_HOME="${HF_HOME:-$SCRATCH_ROOT/.cache/huggingface}"
 export TOKENIZERS_PARALLELISM=false
 
-# Unbuffered Python. Not a preference — it is what makes a failed job
-# diagnosable. Writing to a file rather than a terminal, Python block-buffers
-# stdout in 8 KB chunks, so a process killed before it fills the buffer loses
-# everything it printed. A run that died during model construction and one that
-# never started produce byte-identical empty logs, and there is nothing left to
-# tell them apart. Costs a syscall per line, against a job that logs every
-# twentieth step.
+# Unbuffered stdout: block buffering to a file loses everything a killed process
+# had printed, making a crash indistinguishable from a hang.
 export PYTHONUNBUFFERED=1
 
-# ---------------------------------------------------------------- interpreter
-# Call the virtual environment's interpreter directly rather than going through
-# `uv run`, which is not free here: it re-resolves the project and takes a lock
-# on .venv before it will execute anything, and .venv lives on scratch. Measured
-# on a login node, `uv run python -c "import torch"` took 94 seconds wall for 7
-# seconds of CPU -- almost all of it blocked on the filesystem, and that was one
-# command. A job pays it at every invocation, and two jobs sharing one .venv
-# contend for the same lock; that is how vr-exits spent 24 minutes at 63 MB of
-# resident memory and exited before Python ever started.
-#
-# Nothing is lost by skipping it. The environment is already built by
-# jobs/setup_env.sh, so there is nothing to resolve at job start, and naming the
-# interpreter is what `uv run` would have arrived at anyway. `uv` remains the
-# right tool for *changing* the environment -- just not for entering it.
-#
-# The fallback keeps this working before setup_env.sh has ever run.
+# Call the venv interpreter directly. `uv run` re-resolves the project and locks
+# .venv on every invocation, which on scratch costs minutes per job. The fallback
+# keeps this working before setup_env.sh has built the environment.
 VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv}"
 if [ -x "$VENV_DIR/bin/python" ]; then
     PY=("$VENV_DIR/bin/python")
@@ -64,65 +32,44 @@ else
 fi
 export VENV_DIR
 
-# ---------------------------------------------------------------- Weights & Biases
-export WANDB_PROJECT="${WANDB_PROJECT:-effortless-vertical-routing}"
+# Weights & Biases. Runs stream online by default; WANDB_MODE=offline defers to
+# jobs/sync_wandb.sh. The run id is keyed on the job name so a requeue continues
+# the same run instead of splitting it in two.
+export WANDB_PROJECT="${WANDB_PROJECT:-effortless-transformer}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_DIR="${WANDB_DIR:-$SCRATCH_ROOT/wandb}"
 export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$SCRATCH_ROOT/.cache/wandb}"
-
-# A stable run id keyed on the *experiment*, not on the Slurm job id. A requeued
-# or resumed job gets a new job id, and keying on that would split one training
-# run across several W&B runs with the step counter restarting inside each.
 export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_NAME:-local}}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
-mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$HF_HOME"
-# Slurm writes --output=logs/%x_%j.out before the job body runs, so a missing
-# logs/ makes the job fail with no log at all -- the least diagnosable failure
-# there is. setup_env.sh creates it, but a fresh clone or a moved REPO_DIR would
-# not have run that.
-mkdir -p "$REPO_DIR/logs"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$HF_HOME" "$REPO_DIR/logs"
 
-# ---------------------------------------------------------------- reporting
-report_env() {
-    echo "=================================================================="
-    echo "Job        ${SLURM_JOB_NAME:-<none>} (${SLURM_JOB_ID:-<none>})"
-    echo "Node       ${SLURMD_NODENAME:-<none>}"
-    echo "GPUs       ${CUDA_VISIBLE_DEVICES:-<none>}  (count ${N_GPUS:-?})"
-    echo "Repo       $REPO_DIR"
-    # Which interpreter actually ran. Worth a line: these jobs use the project's
-    # .venv and ignore an active conda environment, so a log that does not say
-    # which one it used leaves "wrong environment" and "real bug" looking
-    # identical when something imports differently than expected.
-    #
-    # Printed, not executed. This used to run `uv run python -c` to ask the
-    # interpreter for its own path, which meant the banner itself blocked on the
-    # scratch filesystem for a minute and a half before the job could start.
-    echo "Python     ${PY[*]}"
-    [ -n "${CONDA_PREFIX:-}" ] && echo "           (conda env $CONDA_PREFIX is active but unused)"
-    echo "Started    $(timestamp)"
-    echo "wandb      project=$WANDB_PROJECT mode=$WANDB_MODE id=$WANDB_RUN_ID"
-    if [ "$WANDB_MODE" = "online" ] && ! wandb_credentials_present; then
-        echo "wandb      WARNING: online mode, but no WANDB_API_KEY and no"
-        echo "           api.wandb.ai entry in ${NETRC:-$HOME/.netrc}. The run"
-        echo "           will go anonymous or fail. Fix with 'wandb login', or"
-        echo "           submit with WANDB_MODE=offline and sync afterwards."
-    fi
-    echo "=================================================================="
-}
-
-# Whether a Weights & Biases credential is reachable. `wandb login` writes an
-# api.wandb.ai entry to ~/.netrc; WANDB_API_KEY overrides it. Checked so an
-# online run that is about to go anonymous says so at the top of the log rather
-# than at the end of training.
+# Whether a W&B credential is reachable (WANDB_API_KEY, or a ~/.netrc entry from
+# `wandb login`). Lets an online run warn up front if it is about to go anonymous.
 wandb_credentials_present() {
     [ -n "${WANDB_API_KEY:-}" ] && return 0
     local netrc="${NETRC:-$HOME/.netrc}"
     [ -f "$netrc" ] && grep -q "api.wandb.ai" "$netrc" 2>/dev/null
 }
 
-# Number of GPUs visible to this job. Slurm reports it when --gres is used;
-# nvidia-smi is the fallback for interactive testing.
+report_env() {
+    echo "=================================================================="
+    echo "Job        ${SLURM_JOB_NAME:-<none>} (${SLURM_JOB_ID:-<none>})"
+    echo "Node       ${SLURMD_NODENAME:-<none>}"
+    echo "GPUs       ${CUDA_VISIBLE_DEVICES:-<none>}  (count ${N_GPUS:-?})"
+    echo "Repo       $REPO_DIR"
+    echo "Python     ${PY[*]}"
+    echo "Started    $(timestamp)"
+    echo "wandb      project=$WANDB_PROJECT mode=$WANDB_MODE id=$WANDB_RUN_ID"
+    if [ "$WANDB_MODE" = "online" ] && ! wandb_credentials_present; then
+        echo "wandb      WARNING: online mode but no credential; run 'wandb login'"
+        echo "           or submit with WANDB_MODE=offline and sync afterwards."
+    fi
+    echo "=================================================================="
+}
+
+# GPUs visible to this job: Slurm reports it under --gres, nvidia-smi is the
+# fallback for interactive testing.
 detect_gpus() {
     if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
         echo "$SLURM_GPUS_ON_NODE"
@@ -133,47 +80,28 @@ detect_gpus() {
     fi
 }
 
-# Most recent checkpoint in a directory, or empty. Used for automatic resume, so
-# a requeued job continues instead of silently restarting from step zero.
-#
-# Written with a glob rather than `ls | sort -V | tail -1` for two reasons, one
-# of which is a bug rather than a preference. Under `set -euo pipefail` the `ls`
-# fails when the directory holds no checkpoints yet — which is the state of
-# *every* first run — the failure propagates through pipefail, and the job dies
-# before training starts. The second reason is that `sort -V` is GNU-only, so
-# the pipeline was not testable outside Linux either.
+# Newest step-*.pt in a directory, or empty. A glob (not `ls | sort -V`) so it
+# does not fail under `set -e` when a first run's directory is still empty.
 latest_checkpoint() {
     local dir="$1" newest="" best=-1 file base step
     shopt -s nullglob
     for file in "$dir"/step-*.pt; do
         base="$(basename "$file")"
-        step="${base#step-}"
-        step="${step%.pt}"
-        # 10# forces base ten: step-000020.pt would otherwise be read as octal.
-        step=$((10#$step))
-        if [ "$step" -gt "$best" ]; then
-            best="$step"
-            newest="$file"
-        fi
+        step="${base#step-}"; step="${step%.pt}"
+        step=$((10#$step))  # base ten: step-000020.pt is not octal
+        if [ "$step" -gt "$best" ]; then best="$step"; newest="$file"; fi
     done
     shopt -u nullglob
     printf '%s' "$newest"
 }
 
-# ISO-8601 timestamp. `date -Is` is GNU-only and errors on BSD/macOS, which
-# makes these scripts untestable off the cluster for no benefit.
+# ISO-8601 timestamp. `date +%...` rather than `date -Is`, which is GNU-only.
 timestamp() {
     date +%Y-%m-%dT%H:%M:%S%z
 }
 
-
-# Report a nonzero exit loudly, and from Slurm's accounting as well as the log.
-#
-# A job that dies before its first flush leaves a log that simply stops, which is
-# indistinguishable from a hung job. train.sh grew this after a run failed with an
-# empty .err file; every job script should have it, so it lives here rather than
-# being copied per script.
-#
+# Report a nonzero exit loudly, including from Slurm's accounting, since a job
+# that dies before its first flush leaves a log that simply stops.
 # Install with:  trap report_failure EXIT
 report_failure() {
     local status=$?
@@ -182,18 +110,11 @@ report_failure() {
     echo "=================================================================="
     echo "FAILED with status $status"
     case "$status" in
-        1)   echo "  1 is a plain error. Read upward for the first message; with"
-             echo "  'set -e' the job stops at the first failing command." ;;
-        127) echo "  127 is command-not-found. Usually a stale checkout: the"
-             echo "  script references a module or flag that this commit lacks."
-             echo "  Try 'git pull' in $REPO_DIR." ;;
-        137) echo "  137 is SIGKILL. On this cluster that is almost always the"
-             echo "  cgroup OOM killer, meaning host RAM, not GPU memory."
-             echo "  A CUDA OOM raises a Python exception and leaves a traceback." ;;
-        139) echo "  139 is a segmentation fault, usually a native library." ;;
-        143) echo "  143 is SIGTERM: the wall clock ran out, or scancel." ;;
+        127) echo "  command-not-found; usually a stale checkout. Try 'git pull'." ;;
+        137) echo "  SIGKILL, almost always the cgroup OOM killer (host RAM)." ;;
+        139) echo "  segmentation fault, usually a native library." ;;
+        143) echo "  SIGTERM: the wall clock ran out, or scancel." ;;
     esac
-    echo "Slurm's own accounting, which survives when the log does not:"
     sacct -j "${SLURM_JOB_ID:-0}" \
         -o JobID%20,JobName%14,State%22,ExitCode,MaxRSS,Elapsed 2>/dev/null \
         || echo "  (sacct unavailable)"
