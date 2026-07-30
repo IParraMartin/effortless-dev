@@ -77,6 +77,11 @@ export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_NAME:-local}}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$HF_HOME"
+# Slurm writes --output=logs/%x_%j.out before the job body runs, so a missing
+# logs/ makes the job fail with no log at all -- the least diagnosable failure
+# there is. setup_env.sh creates it, but a fresh clone or a moved REPO_DIR would
+# not have run that.
+mkdir -p "$REPO_DIR/logs"
 
 # ---------------------------------------------------------------- reporting
 report_env() {
@@ -159,4 +164,38 @@ latest_checkpoint() {
 # makes these scripts untestable off the cluster for no benefit.
 timestamp() {
     date +%Y-%m-%dT%H:%M:%S%z
+}
+
+
+# Report a nonzero exit loudly, and from Slurm's accounting as well as the log.
+#
+# A job that dies before its first flush leaves a log that simply stops, which is
+# indistinguishable from a hung job. train.sh grew this after a run failed with an
+# empty .err file; every job script should have it, so it lives here rather than
+# being copied per script.
+#
+# Install with:  trap report_failure EXIT
+report_failure() {
+    local status=$?
+    [ "$status" -eq 0 ] && return 0
+    echo
+    echo "=================================================================="
+    echo "FAILED with status $status"
+    case "$status" in
+        1)   echo "  1 is a plain error. Read upward for the first message; with"
+             echo "  'set -e' the job stops at the first failing command." ;;
+        127) echo "  127 is command-not-found. Usually a stale checkout: the"
+             echo "  script references a module or flag that this commit lacks."
+             echo "  Try 'git pull' in $REPO_DIR." ;;
+        137) echo "  137 is SIGKILL. On this cluster that is almost always the"
+             echo "  cgroup OOM killer, meaning host RAM, not GPU memory."
+             echo "  A CUDA OOM raises a Python exception and leaves a traceback." ;;
+        139) echo "  139 is a segmentation fault, usually a native library." ;;
+        143) echo "  143 is SIGTERM: the wall clock ran out, or scancel." ;;
+    esac
+    echo "Slurm's own accounting, which survives when the log does not:"
+    sacct -j "${SLURM_JOB_ID:-0}" \
+        -o JobID%20,JobName%14,State%22,ExitCode,MaxRSS,Elapsed 2>/dev/null \
+        || echo "  (sacct unavailable)"
+    echo "=================================================================="
 }

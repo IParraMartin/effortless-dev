@@ -32,6 +32,7 @@ set -euo pipefail
 MAX_DOCS="${1:-none}"
 
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
+trap report_failure EXIT
 cd "$REPO_DIR"
 report_env
 

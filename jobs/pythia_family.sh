@@ -43,6 +43,7 @@ shift || true
 EXTRA_FLAGS=("$@")
 
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
+trap report_failure EXIT
 cd "$REPO_DIR"
 report_env
 
@@ -86,7 +87,7 @@ echo
     --device=cuda \
     --dtype=bf16 \
     --batch_size=8 \
-    "${EXTRA_FLAGS[@]}"
+    ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
 
 echo
 echo "Then compare, in the only unit that crosses tokenizers:"

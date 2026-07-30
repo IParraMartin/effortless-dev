@@ -58,6 +58,7 @@ shift || true
 EXTRA_FLAGS=("$@")
 
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
+trap report_failure EXIT
 cd "$REPO_DIR"
 report_env
 
@@ -95,7 +96,7 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "build" ]; then
         --exit_adapter_rank="$RANK" \
         --exit_every="$EXIT_EVERY" \
         --device=cuda \
-        "${EXTRA_FLAGS[@]}"
+        ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
     echo
 fi
 
@@ -126,7 +127,7 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "train" ]; then
         --exits_per_step=2 --find_unused_parameters=true \
         --grad_diagnostics_every=1000 \
         --wandb_project="$WANDB_PROJECT" \
-        "${EXTRA_FLAGS[@]}"
+        ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
     echo
 
     echo "== A1 check: is the parent still bit-identical after training? =="

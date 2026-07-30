@@ -73,6 +73,7 @@ shift 2 || true
 EXTRA_FLAGS=("$@")
 
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
+trap report_failure EXIT
 cd "$REPO_DIR"
 report_env
 
@@ -126,7 +127,7 @@ parent)
         --save_init_to="$PARENT" \
         --out_dir="$SCRATCH_ROOT/checkpoints/parent-scratch-seed${SEED}" \
         --wandb_project=none \
-        "${EXTRA_FLAGS[@]}"
+        ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
     echo
     echo "parent digest:"
     sha256sum "$PARENT"
@@ -165,7 +166,7 @@ final | multi)
         --init_from="$PARENT" \
         --out_dir="$OUT_DIR" \
         --grad_diagnostics_every=4000 \
-        "${EXTRA_FLAGS[@]}"
+        ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
     ;;
 *)
     echo "error: mode must be parent | final | multi, got '$MODE'" >&2
