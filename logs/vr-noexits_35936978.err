@@ -1,0 +1,51 @@
+W0727 23:16:59.666000 2186192 torch/distributed/run.py:874] 
+W0727 23:16:59.666000 2186192 torch/distributed/run.py:874] *****************************************
+W0727 23:16:59.666000 2186192 torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0727 23:16:59.666000 2186192 torch/distributed/run.py:874] *****************************************
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /global/home/users/iparra/.netrc.
+wandb: W&B API key is configured. Use `wandb login --relogin` to force relogin
+wandb: setting up run vr-noexits
+wandb: Tracking run with wandb version 0.28.1
+wandb: Run data is saved locally in /global/scratch/users/iparra/wandb/wandb/run-20260727_231806-vr-noexits
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run vr-noexits
+wandb: ⭐️ View project at https://wandb.ai/iparramartin/effortless-vertical-routing
+wandb: 🚀 View run at https://wandb.ai/iparramartin/effortless-vertical-routing/runs/vr-noexits
+/global/scratch/users/iparra/effortless-dev/.venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+/global/scratch/users/iparra/effortless-dev/.venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+wandb: updating run metadata
+wandb: uploading output.log; uploading wandb-summary.json; uploading config.yaml
+wandb: uploading history steps 1983-1983, summary, console lines 4148-4148
+wandb: 
+wandb: Run history:
+wandb:  eval/exit_ce/layer_11 █▄▄▄▃▃▃▃▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:              eval/loss █▅▄▄▃▃▃▃▃▂▂▂▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:         sweep/accuracy ▁▃▄▄▄▅▆▆▆▇▇▇██▇████
+wandb:   sweep/best_threshold ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:    sweep/compute_saved ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:  sweep/mean_exit_depth ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb: train/exit_ce/layer_11 ██▆▅▄▃▃▃▃▂▂▂▂▂▂▂▂▂▂▂▁▁▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:             train/loss █▇▇█▇▅▅▅▄▄▃▅▃▄▂▄▃▄▃▃▄▃▃▂▃▂▃▂▂▂▂▂▂▂▂▂▂▁▁▂
+wandb:               train/lr ██████████▇▇▇▇▇▇▆▆▆▆▅▅▄▄▄▄▄▃▃▂▂▂▁▁▁▁▁▁▁▁
+wandb:           train/tokens ▁▁▁▁▁▂▂▂▂▂▃▃▃▃▃▃▄▄▄▄▄▄▅▅▆▆▆▆▆▆▆▆▇▇▇▇▇▇██
+wandb:                     +1 ...
+wandb: 
+wandb: Run summary:
+wandb:  eval/exit_ce/layer_11 3.20245
+wandb:              eval/loss 3.20245
+wandb:         sweep/accuracy 0.35449
+wandb:   sweep/best_threshold 0
+wandb:    sweep/compute_saved 0
+wandb:  sweep/mean_exit_depth 12
+wandb: train/exit_ce/layer_11 3.13071
+wandb:             train/loss 3.13071
+wandb:               train/lr 3e-05
+wandb:           train/tokens 2499608576
+wandb:                     +1 ...
+wandb: 
+wandb: 🚀 View run vr-noexits at: https://wandb.ai/iparramartin/effortless-vertical-routing/runs/vr-noexits
+wandb: ⭐️ View project at: https://wandb.ai/iparramartin/effortless-vertical-routing
+wandb: Synced 5 W&B file(s), 19 media file(s), 38 artifact file(s) and 0 other file(s)
+wandb: Find logs at: /global/scratch/users/iparra/wandb/wandb/run-20260727_231806-vr-noexits/logs

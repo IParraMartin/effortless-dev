@@ -1,0 +1,22 @@
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /global/home/users/iparra/.netrc.
+wandb: Currently logged in as: parrainigo (iparramartin) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run wandb-check-35917142
+wandb: Tracking run with wandb version 0.28.1
+wandb: Run data is saved locally in /global/scratch/users/iparra/wandb/wandb/run-20260727_145928-wandb-check-35917142
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run wandb-check-35917142
+wandb: ⭐️ View project at https://wandb.ai/iparramartin/effortless-vertical-routing
+wandb: 🚀 View run at https://wandb.ai/iparramartin/effortless-vertical-routing/runs/wandb-check-35917142
+wandb: updating run metadata
+wandb: uploading history steps 0-0, summary
+wandb: 
+wandb: Run history:
+wandb: check/ok ▁
+wandb: 
+wandb: Run summary:
+wandb: check/ok 1
+wandb: 
+wandb: 🚀 View run wandb-check-35917142 at: https://wandb.ai/iparramartin/effortless-vertical-routing/runs/wandb-check-35917142
+wandb: ⭐️ View project at: https://wandb.ai/iparramartin/effortless-vertical-routing
+wandb: Synced 4 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
+wandb: Find logs at: /global/scratch/users/iparra/wandb/wandb/run-20260727_145928-wandb-check-35917142/logs
